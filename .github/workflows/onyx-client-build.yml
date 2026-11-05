@@ -1,0 +1,19 @@
+name: onyx client build
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the game client
+        run: cargo build --release -p horizon-client
+      - name: Upload the client
+        uses: actions/upload-artifact@v4
+        with:
+          name: onyx-horizon-client-windows
+          path: target/release/horizon-client.exe
