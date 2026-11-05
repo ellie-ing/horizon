@@ -1169,7 +1169,29 @@ impl Loading {
         let Some(gui) = &self.gui else {
             // The pack's screens do not exist yet: the boot screen holds the
             // window, the wordmark and the console's lines while they load.
-            horizon_client::ui_theme::draw_boot(&self.boot, batch, &logs);
+            // ONYX fork: the boot bar eases toward the loader's stage
+            // fraction instead of jumping stage to stage; it never passes
+            // the real fraction.
+            let now = Instant::now();
+            let dt = self
+                .boot_frame_at
+                .map_or(0.0, |at| now.duration_since(at).as_secs_f32());
+            self.boot_frame_at = Some(now);
+            let target = self.progress.fraction();
+            let step = 1.0 - (-dt * 3.5).exp();
+            self.boot_shown =
+                (self.boot_shown + (target - self.boot_shown) * step).min(target);
+            if target - self.boot_shown < 0.001 {
+                self.boot_shown = target;
+            }
+            horizon_client::ui_theme::draw_boot(
+                &self.boot,
+                batch,
+                &logs,
+                self.progress.line(),
+                self.boot_shown,
+                self.started.elapsed(),
+            );
             return;
         };
         if self.menu.pending.is_some() {
@@ -1311,6 +1333,8 @@ mod tests {
             delivered: false,
             handle: None,
             shown: false,
+            boot_shown: 0.0,
+            boot_frame_at: None,
             ui_at: None,
             title_drawn: false,
             menu: StartupMenu::default(),

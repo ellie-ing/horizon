@@ -11,7 +11,7 @@
 //! function draws and hit-tests, so they never disagree.
 use crate::hud::{HudAtlas, HudBatch, Rect};
 use ab_glyph::{Font as _, FontRef, PxScale, ScaleFont as _};
-use std::{cell::RefCell, collections::HashMap, path::Path};
+use std::{cell::RefCell, collections::HashMap, path::Path, time::Duration};
 
 /// A Horizon-only preference from `horizon.txt` beside `options.txt`
 /// (`key:value` lines), so vanilla's options file stays exactly as vanilla
@@ -539,11 +539,37 @@ impl<'a> Ui<'a> {
 /// console lines (the theme's ink is for light pages).
 const BOOT_TEXT: u32 = color::hex(0xFFFFFF, 255);
 const BOOT_LOG: u32 = color::hex(0x9BA1A6, 255);
+// ONYX fork: the boot screen is the ONYX loading screen, the launcher's: an
+// ice-blue accent whose bar fill runs to white at its leading edge, and the
+// same blue translucent for the wordmark's glow — the HUD has no blur or
+// gradient, so the glow is offset under-draws of the wordmark and the
+// gradient a brighter final segment of the fill.
+const BOOT_ICE: u32 = color::hex(0xBCD6FF, 255);
+const BOOT_GLOW: u32 = color::hex(0x8CB4FF, 255);
+/// The wordmark's sub-line, a muted ice blue-grey.
+const BOOT_SUB: u32 = color::hex(0x9FB4D8, 255);
+/// The progress meta row under the bar, dimmed white.
+const BOOT_DIM: u32 = color::hex(0xFFFFFF, 140);
+/// The bar's track, white barely over the black, and its thin border.
+const BOOT_TRACK: u32 = color::hex(0xFFFFFF, 16);
+const BOOT_BORDER: u32 = color::hex(0xBCD6FF, 90);
+/// The progress bar's height in dp.
+const BOOT_BAR: f32 = 6.0;
 
-/// The boot screen while the menu is not ready yet: the wordmark centred on
-/// pure black and the console's last lines at the bottom right, as the
-/// terminal prints them.
-pub fn draw_boot(atlas: &HudAtlas, batch: &mut HudBatch, logs: &[String]) {
+/// The boot screen while the menu is not ready yet: the ONYX wordmark
+/// centred on pure black, the loader's progress under it and the console's
+/// last lines at the bottom left, as the terminal prints them. `fraction`
+/// is the bar's displayed fraction: the caller eases it toward the loader's
+/// stage fraction, so the bar never claims more than the loader has
+/// reached. `elapsed` drives the glow's gentle pulse.
+pub fn draw_boot(
+    atlas: &HudAtlas,
+    batch: &mut HudBatch,
+    logs: &[String],
+    stage: &str,
+    fraction: f32,
+    elapsed: Duration,
+) {
     // Pure black under everything: the frame's panorama (the title artwork
     // once the bundle is in) must not leak through.
     batch.fill(
@@ -554,26 +580,158 @@ pub fn draw_boot(atlas: &HudAtlas, batch: &mut HudBatch, logs: &[String]) {
         batch.height,
         color::hex(0x000000, 255),
     );
-    wordmark(atlas, batch);
+    wordmark(atlas, batch, elapsed);
+    boot_progress(atlas, batch, stage, fraction, elapsed);
     draw_boot_log(atlas, batch, logs);
 }
 
-/// The wordmark with its tagline, centred.
-fn wordmark(atlas: &HudAtlas, batch: &mut HudBatch) {
-    let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
+/// The boot screen's centred column — wordmark, sub-line, bar and meta row —
+/// laid out once so every piece hangs off the same edges. The GDI boot
+/// paint (`horizon_threads::boot_paint`) mirrors these formulas by hand.
+struct BootLayout {
+    size: f32,
+    small: f32,
+    top: f32,
+    left: f32,
+    right: f32,
+    sub_y: f32,
+    bar_y: f32,
+    meta_y: f32,
+}
+
+fn boot_layout(ui: &Ui) -> BootLayout {
     let size = (ui.w / 16.0).clamp(DISPLAY, 96.0);
     let small = (size * 0.25).clamp(MICRO, 18.0);
-    let block = size * 1.45 + small * 0.6 + small * 1.5;
-    let top = (ui.h - block) / 2.0;
-    ui.text_centered(Face::SemiBold, size, ui.w / 2.0, top, BOOT_TEXT, "Horizon");
-    ui.text_centered(
-        Face::Mono,
+    let mark = ui.measure(Face::SemiBold, size, "ONYX");
+    let total = size * 1.45 + small * 0.6 + small * 1.5 + size * 0.55 + BOOT_BAR + 9.0 + MICRO * 1.5;
+    let top = (ui.h - total) / 2.0;
+    let sub_y = top + size * 1.45 + small * 0.6;
+    let bar_y = sub_y + small * 1.5 + size * 0.55;
+    BootLayout {
+        size,
         small,
-        ui.w / 2.0,
-        top + size * 1.45 + small * 0.6,
-        BOOT_LOG,
-        "Rust based minecraft client",
+        top,
+        left: ui.w / 2.0 - mark / 2.0,
+        right: ui.w / 2.0 + mark / 2.0,
+        sub_y,
+        bar_y,
+        meta_y: bar_y + BOOT_BAR + 9.0,
+    }
+}
+
+/// The wordmark, centred: ONYX in the design system's SemiBold over a
+/// letterspaced mono sub-line that ends at the wordmark's right edge.
+fn wordmark(atlas: &HudAtlas, batch: &mut HudBatch, elapsed: Duration) {
+    let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
+    let l = boot_layout(&ui);
+    // ONYX fork: the glow is the wordmark drawn again at small offsets in
+    // translucent ice blue, pulsing gently with the elapsed time — the
+    // closest the HUD's flat text comes to a blurred halo.
+    let pulse = 0.5 + 0.5 * (elapsed.as_secs_f32() * 2.2).sin();
+    let glow = color::with_alpha(BOOT_GLOW, 0.10 + 0.14 * pulse);
+    let d = (l.size * 0.022).max(1.5);
+    for (dx, dy) in [(-d, 0.0), (d, 0.0), (0.0, d)] {
+        ui.text(Face::SemiBold, l.size, l.left + dx, l.top + dy, glow, "ONYX");
+    }
+    ui.text(Face::SemiBold, l.size, l.left, l.top, BOOT_TEXT, "ONYX");
+    text_tracked_right(
+        &mut ui,
+        Face::Mono,
+        l.small,
+        l.right,
+        l.sub_y,
+        l.small * 0.16,
+        l.right - l.left,
+        BOOT_SUB,
+        "HORIZON CLIENT",
     );
+    ui.finish();
+}
+
+/// `text` with `tracking` dp of extra advance between the glyphs, ending at
+/// `right`: the sub-line's letterspacing, which `Ui::text` has no knob for.
+/// The tracking shrinks rather than let the line outgrow `max_w`.
+fn text_tracked_right(
+    ui: &mut Ui,
+    face: Face,
+    size: f32,
+    right: f32,
+    y: f32,
+    tracking: f32,
+    max_w: f32,
+    color: u32,
+    text: &str,
+) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return;
+    }
+    let widths: Vec<f32> = chars
+        .iter()
+        .map(|c| ui.measure(face, size, &c.to_string()))
+        .collect();
+    let plain: f32 = widths.iter().sum();
+    let gaps = (chars.len() - 1) as f32;
+    let tracking = if gaps > 0.0 {
+        tracking.min(((max_w - plain) / gaps).max(0.0))
+    } else {
+        0.0
+    };
+    let mut x = right - (plain + tracking * gaps);
+    for (c, w) in chars.iter().zip(&widths) {
+        let mut buf = [0u8; 4];
+        ui.text(face, size, x, y, color, c.encode_utf8(&mut buf));
+        x += w + tracking;
+    }
+}
+
+/// The loader's progress under the wordmark: the bar across the wordmark's
+/// width, and under it the meta row — the stage on the left, the percentage
+/// on the right.
+fn boot_progress(
+    atlas: &HudAtlas,
+    batch: &mut HudBatch,
+    stage: &str,
+    fraction: f32,
+    elapsed: Duration,
+) {
+    let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
+    let l = boot_layout(&ui);
+    let fraction = fraction.clamp(0.0, 1.0);
+    let w = l.right - l.left;
+    let fill_w = (w - 2.0).max(0.0) * fraction;
+    if fill_w > 0.0 {
+        // The fill's soft leading edge, a translucent ice plate just past it.
+        let pulse = 0.5 + 0.5 * (elapsed.as_secs_f32() * 2.2).sin();
+        let glow = color::with_alpha(BOOT_GLOW, 0.14 + 0.10 * pulse);
+        ui.rounded(l.left - 0.5, l.bar_y - 1.5, fill_w + 3.0, BOOT_BAR + 3.0, 4.0, glow);
+    }
+    ui.rounded(l.left, l.bar_y, w, BOOT_BAR, 3.0, BOOT_TRACK);
+    if fill_w > 0.0 {
+        ui.rounded(l.left + 1.0, l.bar_y + 1.0, fill_w, BOOT_BAR - 2.0, 2.0, BOOT_ICE);
+        // The fill runs to white at its leading edge.
+        let seg = fill_w.min(16.0);
+        ui.rounded(
+            l.left + 1.0 + fill_w - seg,
+            l.bar_y + 1.0,
+            seg,
+            BOOT_BAR - 2.0,
+            2.0,
+            BOOT_TEXT,
+        );
+    }
+    ui.border(l.left, l.bar_y, w, BOOT_BAR, 3.0, BOOT_BORDER);
+    ui.text(
+        Face::Mono,
+        MICRO,
+        l.left,
+        l.meta_y,
+        BOOT_DIM,
+        &stage.to_uppercase(),
+    );
+    let pct = format!("{:.0}%", fraction * 100.0);
+    let pct_w = ui.measure(Face::Mono, MICRO, &pct);
+    ui.text(Face::Mono, MICRO, l.right - pct_w, l.meta_y, BOOT_DIM, &pct);
     ui.finish();
 }
 
@@ -693,7 +851,7 @@ mod tests {
         reset_atlas();
         let atlas = HudAtlas::boot();
         let mut batch = HudBatch::new([1280, 720]);
-        draw_boot(&atlas, &mut batch, &[]);
+        draw_boot(&atlas, &mut batch, &[], "Loading menu", 0.0, Duration::ZERO);
         // The first quad is the pure black backdrop over the frame's panorama.
         let (w, h) = (batch.width, batch.height);
         let bg = &batch.vertices[..6];
@@ -706,7 +864,7 @@ mod tests {
         );
 
         let mut batch = HudBatch::new([1280, 720]);
-        wordmark(&atlas, &mut batch);
+        wordmark(&atlas, &mut batch, Duration::ZERO);
         let (min, max) = batch
             .vertices
             .iter()

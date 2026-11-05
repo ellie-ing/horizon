@@ -21619,6 +21619,11 @@ struct Loading {
     delivered: bool,
     handle: Option<JoinHandle<()>>,
     shown: bool,
+    /// ONYX fork: the boot bar's displayed fraction, eased toward
+    /// `progress`'s stage fraction, and when the last boot frame drew, so
+    /// the easing runs on frame time.
+    boot_shown: f32,
+    boot_frame_at: Option<Instant>,
     /// When the menu bundle arrived (`set_ui`), and whether a title frame with
     /// it was presented since: the world renderer waits for that frame
     /// (`ready_for_handoff`).
@@ -21686,13 +21691,28 @@ impl Loading {
         let boot_paint_stop = hwnd(&window).map(|hwnd| {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let repaint_stop = stop.clone();
+            // ONYX fork: the painted boot screen shows the loader's progress
+            // too: the stage fraction, eased at the repaint cadence so the
+            // painted bar glides like the wgpu one and never passes the real
+            // fraction.
+            let progress = self.progress.clone();
+            let started = self.started;
             std::thread::spawn(move || {
+                let mut shown = 0.0f32;
                 while !repaint_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let target = progress.fraction();
+                    shown += (target - shown) * 0.4;
+                    if target - shown < 0.002 {
+                        shown = target;
+                    }
                     horizon_threads::boot_paint::paint(
                         hwnd,
                         horizon_theme::fonts::GEIST_SEMIBOLD,
                         horizon_theme::fonts::GEIST_MONO,
                         &horizon_client::logging::recent_lines(),
+                        shown,
+                        progress.line(),
+                        started.elapsed(),
                     );
                     std::thread::sleep(std::time::Duration::from_millis(300));
                 }
@@ -22076,6 +22096,8 @@ fn run_loading(
         delivered: false,
         handle: Some(loader),
         shown: false,
+        boot_shown: 0.0,
+        boot_frame_at: None,
         ui_at: None,
         title_drawn: false,
         menu,

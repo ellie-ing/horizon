@@ -327,18 +327,38 @@ pub(super) fn build(vanilla: &Path, packs: &[Pack], out: &Path) -> io::Result<()
     {
         return Ok(());
     }
-    // An interrupted/failed rebuild must never leave a reusable marker.
-    match fs::remove_file(&marker_path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    // ONYX fork: build beside the live overlay and swap the finished
+    // tree in, instead of deleting the marker and building in place.
+    // A launch closed mid-build then leaves the previous cache — and
+    // its marker — fully intact, so the next launch reuses it (the
+    // fast path above revalidates the marker against the current
+    // inputs, so a stale marker can never bless a mismatched tree)
+    // rather than restarting the build from nothing. The build also
+    // announces itself: upstream logged nothing here, and a silent
+    // multi-minute build reads exactly like a hang.
+    log::info!(
+        "Horizon: building the resource pack overlay for {} pack(s); \
+         a first launch with a selection can take a few minutes",
+        packs.len()
+    );
+    let build_started = std::time::Instant::now();
+    let mut building_name = out.as_os_str().to_os_string();
+    building_name.push(".building");
+    let building = PathBuf::from(building_name);
     let mut dependencies = Dependencies {
         tracking: signature.is_ok(),
         vanilla: vanilla_key.clone(),
         ..Dependencies::default()
     };
-    build_overlay_uncached(vanilla, packs, out, &mut dependencies)?;
+    build_overlay_uncached(vanilla, packs, &building, &mut dependencies)?;
+    if out.exists() {
+        fs::remove_dir_all(out)?;
+    }
+    fs::rename(&building, out)?;
+    log::info!(
+        "Horizon: resource pack overlay ready after {} ms",
+        build_started.elapsed().as_millis()
+    );
     if let Ok(signature) = signature
         && dependencies.valid()
         && pack_signature(packs).is_ok_and(|s| s == signature)
@@ -647,9 +667,13 @@ mod tests {
         }
         // Missing selected source disables reuse; the original directory builder
         // still tolerates it, and does not publish a marker for an incomplete input.
+        // ONYX fork: the previous marker is no longer deleted up front —
+        // it stays, unrewritten, and simply cannot validate against the
+        // incomplete input, so the next launch rebuilds instead of reusing.
+        let marker_before = fs::read(&marker).unwrap();
         fs::remove_dir_all(f.0.join("low")).unwrap();
         f.rebuild_matches(&[low]);
-        assert!(!marker.exists());
+        assert_eq!(fs::read(&marker).unwrap(), marker_before);
     }
 
     #[test]
@@ -723,14 +747,20 @@ mod tests {
         assert!(
             packs::build_overlay(&f.0.join("vanilla"), std::slice::from_ref(&pack), &out).is_err()
         );
-        assert!(!marker_path(&out).exists());
+        // ONYX fork: a failed build no longer deletes the marker or the
+        // tree — the last good build stays published (and this marker
+        // cannot validate against the broken archive in any case).
+        assert!(marker_path(&out).exists());
+        assert_eq!(fs::read(out.join(name)).unwrap(), b"bbb");
         f.write("pack.zip", &archive(&files(b"ddd"), true));
         f.rebuild_matches(std::slice::from_ref(&pack));
         fs::remove_file(f.0.join("pack.zip")).unwrap();
         assert!(
             packs::build_overlay(&f.0.join("vanilla"), std::slice::from_ref(&pack), &out).is_err()
         );
-        assert!(!marker_path(&out).exists());
+        // ONYX fork: as above — the last good build ("ddd") stays live.
+        assert!(marker_path(&out).exists());
+        assert_eq!(fs::read(out.join(name)).unwrap(), b"ddd");
         assert!(
             packs::resource_root(&f.0.join("vanilla"), &[pack], &f.0.join("selection-cache"))
                 .is_err()
@@ -853,8 +883,16 @@ mod tests {
             f.0.join("outside").to_string_lossy().into_owned(),
         ] {
             pack.overlays = vec![overlay];
+            let marker_before = fs::read(marker_path(&f.0.join("cached"))).ok();
             f.rebuild_matches(std::slice::from_ref(&pack));
-            assert!(!marker_path(&f.0.join("cached")).exists());
+            // ONYX fork: an untrackable (external) overlay publishes no
+            // marker; the previous one is left in place, unrewritten —
+            // it cannot validate while the signature is untrackable,
+            // and the changed content below proves nothing was reused.
+            assert_eq!(
+                fs::read(marker_path(&f.0.join("cached"))).ok(),
+                marker_before
+            );
             f.write(&format!("outside/{name}"), br#"{"p":4}"#);
             f.rebuild_matches(std::slice::from_ref(&pack));
             assert_eq!(
