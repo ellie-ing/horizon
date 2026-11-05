@@ -2,7 +2,7 @@ name: onyx client build
 on:
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -12,8 +12,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build the game client
         run: cargo build --release -p horizon-client
+      - name: Checksum the client
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash target/release/horizon-client.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  horizon-client.exe" | Out-File -Encoding ascii horizon-client.exe.sha256
       - name: Upload the client
         uses: actions/upload-artifact@v4
         with:
           name: onyx-horizon-client-windows
           path: target/release/horizon-client.exe
+      - name: Publish the fork client release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fork-client-${{ github.sha }}
+          name: Fork client ${{ github.sha }}
+          files: |
+            target/release/horizon-client.exe
+            horizon-client.exe.sha256
