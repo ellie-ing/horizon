@@ -606,13 +606,219 @@ fn junction(target: &Path, at: &Path) -> io::Result<()> {
     horizon_threads::junction(target, at)
 }
 #[cfg(not(windows))]
+#[allow(dead_code)] // ONYX fork: called from the Windows `linked_whole` only.
 fn junction(_: &Path, _: &Path) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
+}
+// ONYX fork: the helpers of the parallel, resumable overlay build (see
+// `build_overlay_uncached`). A build killed mid-way leaves its tree
+// behind (the cache builds into a sibling and swaps it in only when
+// complete); the next build resumes it instead of starting over, so
+// entries already in place and correct must be recognisable.
+/// A file's identity, following symlinks: a symlink or hardlink at
+/// `path` resolves to its target's own identity. (Device, inode) on
+/// unix; on Windows (creation time, size) — the volume serial and
+/// file index are still unstable in std (`windows_by_handle`), and a
+/// hardlink shares its source's creation time while a copy restarts
+/// its own. Elsewhere length and write time, which can only make a
+/// resumed build redo work, never skip work it should not.
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        Some((meta.creation_time(), meta.file_size()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let written = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some((meta.len(), written.as_nanos() as u64))
+    }
+}
+/// Whether `dst` already presents `src` (a symlink or hardlink to it):
+/// the entry a resumed build leaves exactly as it is.
+fn already_linked(src: &Path, dst: &Path) -> bool {
+    match (file_identity(src), file_identity(dst)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+/// Removes whatever sits at `path` — a file, a link (a symlink or a
+/// directory junction: the link goes, never what it names) or a whole
+/// directory tree — so a fresh entry can take its place.
+fn remove_entry(path: &Path) -> io::Result<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        return fs::remove_dir_all(path);
+    }
+    fs::remove_file(path).or_else(|e| {
+        // A directory junction or directory symlink on Windows:
+        // remove_file refuses those; remove_dir removes the link.
+        if meta.file_type().is_symlink() {
+            fs::remove_dir(path)
+        } else {
+            Err(e)
+        }
+    })
+}
+/// Writes `bytes` at `dst` through a sibling temp file and a rename, so
+/// a build killed mid-write never leaves a half-written file a resumed
+/// build could mistake for a finished one.
+fn write_atomic(dst: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = dst.as_os_str().to_os_string();
+    tmp.push(".part");
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, dst)
+}
+/// The whole-directory link in place at `at`, or made now; false sends
+/// the mirror to its file-by-file fallback, as a failed `junction`
+/// does today. Off Windows `link` links directories too, and the
+/// mirror's fall-through branch handles them, so this stays false.
+#[cfg(windows)]
+fn linked_whole(target: &Path, at: &Path) -> bool {
+    // A junction a previous, interrupted attempt made is already the
+    // whole-directory link.
+    already_linked(target, at) || junction(target, at).is_ok()
+}
+#[cfg(not(windows))]
+fn linked_whole(_: &Path, _: &Path) -> bool {
+    false
 }
 /// Build `out` as `vanilla` with the packs' files layered on top (packs in
 /// load order, last wins). Untouched directories are links into vanilla.
 pub fn build_overlay(vanilla: &Path, packs: &[Pack], out: &Path) -> io::Result<()> {
     cache::build(vanilla, packs, out)
+}
+
+/// ONYX fork: one unit of overlay work. The mirror walk plans the jobs
+/// in the order the old sequential build did the work itself; they then
+/// run on every thread (`par::par_map`). On Windows a build is ~10⁴
+/// hardlink creations and dependency stats, and one thread made a
+/// first launch with a pack take minutes on a low-end machine.
+enum Job<'a> {
+    /// Records one directory dependency (the stat itself is the work).
+    Record(PathBuf),
+    /// Links `src` at `dst` (a copy where links cannot); with
+    /// `dependency`, also records `src` as a dependency (Windows'
+    /// individually linked vanilla files).
+    Link {
+        src: PathBuf,
+        dst: PathBuf,
+        dependency: bool,
+    },
+    /// A merged stacked file's bytes, written atomically.
+    Write { dst: PathBuf, bytes: &'a [u8] },
+    /// Inflates one zip entry to `dst`, atomically.
+    Extract {
+        owner: usize,
+        inner: &'a str,
+        dst: PathBuf,
+    },
+}
+
+/// ONYX fork: runs one job of the overlay build. Its dependency
+/// records land in a recorder of its own; the caller absorbs them in
+/// job order, which is the order the sequential build recorded in.
+/// `resume` is a build over a previous attempt's partial tree: an
+/// entry already present and correct is left exactly as it is, and
+/// only missing or stale work is redone.
+fn run_job(
+    job: &Job,
+    zips: &[Option<Zip>],
+    resume: bool,
+    dependencies: &mut cache::Dependencies,
+) -> io::Result<()> {
+    match job {
+        Job::Record(dir) => {
+            dependencies.directory(dir);
+            Ok(())
+        }
+        Job::Link {
+            src,
+            dst,
+            dependency,
+        } => {
+            if *dependency {
+                // The old build recorded only files here (a directory
+                // reaching this arm is a unix directory symlink, which
+                // records nothing, and the flag is never set there).
+                #[cfg(not(unix))]
+                if src.is_file() {
+                    dependencies.file(src);
+                }
+            }
+            if resume && already_linked(src, dst) {
+                return Ok(());
+            }
+            if resume && fs::symlink_metadata(dst).is_ok() {
+                remove_entry(dst)?;
+            }
+            link(src, dst)
+        }
+        Job::Write { dst, bytes } => {
+            if resume && fs::read(dst).is_ok_and(|existing| existing == *bytes) {
+                return Ok(());
+            }
+            write_atomic(dst, bytes)
+        }
+        Job::Extract { owner, inner, dst } => {
+            let Some(Some(z)) = zips.get(*owner) else {
+                return Ok(());
+            };
+            // One unreadable entry costs that file, not the pack: an error here
+            // failed the build and the reload dropped every server pack in the stack.
+            match z.read(inner) {
+                Ok(bytes) => {
+                    if resume && fs::read(dst).is_ok_and(|existing| existing == bytes) {
+                        Ok(())
+                    } else {
+                        write_atomic(dst, &bytes)
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Horizon: skipping unreadable pack entry {inner}: {e}");
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// ONYX fork: removes what a previous, interrupted attempt left in
+/// `out` that the current inputs no longer produce, so a resumed build
+/// lands on exactly the tree a fresh build would. `produced` holds the
+/// paths the walk placed; linked directories are leaves (their
+/// contents are the link target's, not the tree's).
+fn prune_stale(out: &Path, produced: &BTreeSet<PathBuf>) -> io::Result<()> {
+    fn walk(dir: &Path, produced: &BTreeSet<PathBuf>) -> io::Result<()> {
+        for entry in fs::read_dir(dir)?.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !produced.contains(&path) {
+                remove_entry(&path)?;
+            } else if meta.is_dir() && !meta.file_type().is_symlink() {
+                walk(&path, produced)?;
+            }
+        }
+        Ok(())
+    }
+    walk(out, produced)
 }
 
 fn build_overlay_uncached(
@@ -621,9 +827,13 @@ fn build_overlay_uncached(
     out: &Path,
     dependencies: &mut cache::Dependencies,
 ) -> io::Result<()> {
-    if out.exists() {
-        fs::remove_dir_all(out)?;
-    }
+    // ONYX fork: an existing tree is a previous attempt's partial work
+    // (the cache builds into a sibling tree and swaps it in only when
+    // complete): resume it instead of wiping it and starting over.
+    // Entries already present and correct are skipped (see `run_job`),
+    // and what the inputs no longer produce is pruned at the end, so
+    // the result is the tree a fresh build would have made.
+    let resume = out.exists();
     fs::create_dir_all(out)?;
     // Final owner of every overridden file.
     let mut files: BTreeMap<String, (usize, Provided)> = BTreeMap::new();
@@ -723,8 +933,11 @@ fn build_overlay_uncached(
             merged.insert(name.clone(), bytes);
         }
     }
-    /// A zip entry to write: its pack, its name in the zip and where it goes.
-    type Extract<'a> = (usize, &'a str, PathBuf);
+    // ONYX fork: the walk no longer does the work itself: it plans
+    // `Job`s (in the order the sequential build did them) and records
+    // the paths it produces, then the jobs run on every thread.
+    // Directory creation still happens in the walk, so every job's
+    // parent folder exists before any job runs.
     #[allow(clippy::too_many_arguments)]
     fn mirror<'a>(
         rel: &str,
@@ -733,10 +946,11 @@ fn build_overlay_uncached(
         touched: &BTreeSet<String>,
         hidden: &BTreeSet<String>,
         files: &'a BTreeMap<String, (usize, Provided)>,
-        merged: &BTreeMap<String, Vec<u8>>,
+        merged: &'a BTreeMap<String, Vec<u8>>,
         filters: &[&Filter],
-        dependencies: &mut cache::Dependencies,
-        extract: &mut Vec<Extract<'a>>,
+        resume: bool,
+        jobs: &mut Vec<Job<'a>>,
+        produced: &mut BTreeSet<PathBuf>,
     ) -> io::Result<()> {
         let src = if rel.is_empty() {
             vanilla.to_path_buf()
@@ -748,8 +962,18 @@ fn build_overlay_uncached(
         } else {
             out.join(rel)
         };
+        // A previous attempt may have linked this directory whole
+        // where this build must mirror it file by file; a real
+        // directory takes its place first, or the writes below would
+        // land in vanilla's tree through the link.
+        if resume
+            && fs::symlink_metadata(&dst).is_ok_and(|m| m.file_type().is_symlink() || !m.is_dir())
+        {
+            remove_entry(&dst)?;
+        }
         fs::create_dir_all(&dst)?;
-        dependencies.directory(&src);
+        produced.insert(dst.clone());
+        jobs.push(Job::Record(src.clone()));
         let mut names: BTreeSet<String> = BTreeSet::new();
         if let Ok(entries) = fs::read_dir(&src) {
             names.extend(
@@ -778,21 +1002,32 @@ fn build_overlay_uncached(
             if hidden.contains(&child) || child == horizon_core::prepared_files::FILE_NAME {
                 continue;
             }
+            let target = out.join(&child);
             if let Some(bytes) = merged.get(&child) {
-                fs::write(out.join(&child), bytes)?;
+                produced.insert(target.clone());
+                jobs.push(Job::Write { dst: target, bytes });
             } else if let Some((owner, (path, inner))) = files.get(&child) {
-                let target = out.join(&child);
+                produced.insert(target.clone());
                 match path {
-                    Some(p) => link(p, &target)?,
-                    // Inflated and written after the walk, on every thread.
-                    None => extract.push((*owner, inner.as_str(), target)),
+                    Some(p) => jobs.push(Job::Link {
+                        src: p.clone(),
+                        dst: target,
+                        dependency: false,
+                    }),
+                    // Inflated when the jobs run, on every thread.
+                    None => jobs.push(Job::Extract {
+                        owner: *owner,
+                        inner: inner.as_str(),
+                        dst: target,
+                    }),
                 }
             } else if filters.is_empty()
                 && !touched.contains(&child)
                 && vanilla.join(&child).is_dir()
-                && junction(&vanilla.join(&child), &out.join(&child)).is_ok()
+                && linked_whole(&vanilla.join(&child), &out.join(&child))
             {
                 // Linked whole, like the unix symlink: no file in it is visited or copied.
+                produced.insert(target);
             } else if touched.contains(&child)
                 // Without a junction Windows cannot link a directory the way unix does (`link`
                 // above), so an untouched one has to be mirrored: skipping it hid textures/font
@@ -801,30 +1036,24 @@ fn build_overlay_uncached(
                 || (vanilla.join(&child).is_dir() && (cfg!(not(unix)) || !filters.is_empty()))
             {
                 mirror(
-                    &child,
-                    vanilla,
-                    out,
-                    touched,
-                    hidden,
-                    files,
-                    merged,
-                    filters,
-                    dependencies,
-                    extract,
+                    &child, vanilla, out, touched, hidden, files, merged, filters, resume, jobs,
+                    produced,
                 )?;
             } else if filters.iter().any(|f| f.blocks(&child)) {
                 // Hidden by a pack's filter.
             } else {
-                #[cfg(not(unix))]
-                if vanilla.join(&child).is_file() {
-                    dependencies.file(&vanilla.join(&child));
-                }
-                link(&vanilla.join(&child), &out.join(&child))?;
+                produced.insert(target.clone());
+                jobs.push(Job::Link {
+                    src: vanilla.join(&child),
+                    dst: target,
+                    dependency: cfg!(not(unix)),
+                });
             }
         }
         Ok(())
     }
-    let mut extract = Vec::new();
+    let mut jobs = Vec::new();
+    let mut produced = BTreeSet::new();
     mirror(
         "",
         vanilla,
@@ -834,27 +1063,33 @@ fn build_overlay_uncached(
         &files,
         &merged,
         &filters,
-        dependencies,
-        &mut extract,
+        resume,
+        &mut jobs,
+        &mut produced,
     )?;
-    // Inflating and writing a big pack's files one by one was most of a cold build; its
-    // folders all exist by now.
-    crate::par::par_map(&extract, |(owner, inner, target)| {
-        let Some(Some(z)) = zips.get(*owner) else {
-            return Ok(());
-        };
-        // One unreadable entry costs that file, not the pack: an error here
-        // failed the build and the reload dropped every server pack in the stack.
-        match z.read(inner) {
-            Ok(bytes) => fs::write(target, bytes),
-            Err(e) => {
-                log::warn!("Horizon: skipping unreadable pack entry {inner}: {e}");
-                Ok(())
-            }
+    // The planned work runs on every thread; results come back in job
+    // order, so the first error is the one the sequential build would
+    // have stopped at, and the recorders absorb in the walk's order.
+    let plain = &*dependencies;
+    let results = crate::par::par_map(&jobs, |job| {
+        let mut recorded = plain.recorder();
+        let result = run_job(job, &zips, resume, &mut recorded);
+        (result, recorded)
+    });
+    let mut first_error = None;
+    for (result, mut recorded) in results {
+        dependencies.absorb(&mut recorded);
+        if first_error.is_none() {
+            first_error = result.err();
         }
-    })
-    .into_iter()
-    .collect()
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    if resume {
+        prune_stale(out, &produced)?;
+    }
+    Ok(())
 }
 /// Files vanilla loads from every pack in turn (`getResourceStack`) rather
 /// than from the top pack only.

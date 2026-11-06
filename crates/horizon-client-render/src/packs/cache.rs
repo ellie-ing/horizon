@@ -42,6 +42,25 @@ impl Dependencies {
     pub(super) fn directory(&mut self, path: &Path) {
         self.record(path, true);
     }
+    // ONYX fork: the overlay build runs its work on every thread (see
+    // packs.rs): each job records into a recorder of its own — same
+    // tracking state and vanilla root, no entries yet — and the caller
+    // absorbs the recorders back in job order, which the builder keeps
+    // equal to the old sequential walk order, so the recorded set (and
+    // its order) is exactly what the single-threaded build recorded.
+    pub(super) fn recorder(&self) -> Dependencies {
+        Dependencies {
+            entries: Vec::new(),
+            failed: false,
+            tracking: self.tracking,
+            vanilla: self.vanilla.clone(),
+        }
+    }
+    /// Folds a [`Dependencies::recorder`]'s entries back into this one.
+    pub(super) fn absorb(&mut self, other: &mut Dependencies) {
+        self.entries.append(&mut other.entries);
+        self.failed |= other.failed;
+    }
     fn valid(&self) -> bool {
         !self.failed
             && self.entries.iter().all(|(path, directory, signature)| {
@@ -359,8 +378,14 @@ pub(super) fn build(vanilla: &Path, packs: &[Pack], out: &Path) -> io::Result<()
         "Horizon: resource pack overlay ready after {} ms",
         build_started.elapsed().as_millis()
     );
+    // ONYX fork: the post-build `dependencies.valid()` re-check is
+    // gone: it re-statted every dependency the build had just consumed
+    // (a second full pass over ~10⁴ entries) before the marker could
+    // be written. The recorded dependencies still validate on the next
+    // launch's fast path, exactly as before, and the pack signature
+    // comparison below still refuses to bless a build whose inputs
+    // changed underneath it.
     if let Ok(signature) = signature
-        && dependencies.valid()
         && pack_signature(packs).is_ok_and(|s| s == signature)
     {
         let marker = Marker {
@@ -1031,6 +1056,92 @@ mod tests {
         packs::build_overlay(&vanilla, &[pack], &out).unwrap();
         assert_eq!(fs::read(out.join(name)).unwrap(), b"pack");
         assert_eq!(fs::read(out.join("facts.json")).unwrap(), b"[]");
+    }
+
+    /// ONYX fork: a build killed mid-way leaves its partial tree in
+    /// the `.building` sibling; the next build resumes it — entries
+    /// already finished are not redone — prunes what the selection no
+    /// longer produces, and lands on exactly the tree a fresh build
+    /// makes.
+    #[test]
+    fn an_interrupted_build_resumes_and_prunes() {
+        let f = Fixture::new();
+        let texture = "assets/minecraft/textures/a";
+        let lang = "assets/minecraft/lang/en_us.json";
+        f.write(&format!("vanilla/{texture}"), b"vanilla");
+        f.write(&format!("vanilla/{lang}"), br#"{"v":1}"#);
+        let pack = f.dir_pack("pack");
+        f.write(&format!("pack/{texture}"), b"pack");
+        let vanilla = f.0.join("vanilla");
+        let selected = std::slice::from_ref(&pack);
+        let out = f.0.join("cached");
+        // The partial tree an interrupted build leaves behind: the
+        // cache builds into `<out>.building` and swaps it in only when
+        // complete, so seed one as a completed attempt would have.
+        let mut building_name = out.as_os_str().to_os_string();
+        building_name.push(".building");
+        let building = PathBuf::from(building_name);
+        build_overlay_uncached(&vanilla, selected, &building, &mut Dependencies::default())
+            .unwrap();
+        // One finished entry is the pack's texture (a link on unix);
+        // another is a written merged file, carrying a sentinel time.
+        #[cfg(unix)]
+        let kept_stats = {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = fs::symlink_metadata(building.join(texture)).unwrap();
+            (meta.ino(), meta.ctime(), meta.ctime_nsec())
+        };
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30);
+        fs::File::options()
+            .write(true)
+            .open(building.join(lang))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // One entry is stale (bytes no build would write), at a path
+        // the build does produce ...
+        f.write("vanilla/assets/minecraft/textures/b", b"vanilla b");
+        fs::write(
+            building.join("assets/minecraft/textures/b"),
+            b"half-written",
+        )
+        .unwrap();
+        // ... and one is not part of the selection's tree at all.
+        fs::write(building.join("stray.txt"), b"stray").unwrap();
+
+        packs::build_overlay(&vanilla, selected, &out).unwrap();
+
+        // The finished entries came through untouched: the link was
+        // not recreated and the merged file was not rewritten.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = fs::symlink_metadata(out.join(texture)).unwrap();
+            assert_eq!((meta.ino(), meta.ctime(), meta.ctime_nsec()), kept_stats);
+        }
+        assert_eq!(
+            fs::metadata(out.join(lang)).unwrap().modified().unwrap(),
+            old
+        );
+        // The stale entry was redone and the stray one pruned.
+        assert_eq!(
+            fs::read(out.join("assets/minecraft/textures/b")).unwrap(),
+            b"vanilla b"
+        );
+        assert!(!out.join("stray.txt").exists());
+        // The result is exactly a from-scratch build's tree.
+        build_overlay_uncached(
+            &vanilla,
+            selected,
+            &f.0.join("reference"),
+            &mut Dependencies::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            output_signature(&out).unwrap(),
+            output_signature(&f.0.join("reference")).unwrap()
+        );
+        assert!(marker_path(&out).exists());
     }
 
     #[test]

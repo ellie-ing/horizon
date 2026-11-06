@@ -526,6 +526,11 @@ struct Options {
     /// is (an SSH session, a server). It counts as `offscreen` for everything else (an
     /// automated run that never shows a window or grabs the pointer).
     headless: bool,
+    /// ONYX fork: `--build-pack-cache`: build the resource pack overlay
+    /// for the saved selection, print the root and exit, before any
+    /// window exists. A launcher pre-warms the cache with it (hidden,
+    /// at low priority) so the player's real start is a cache hit.
+    build_pack_cache: bool,
     /// `--width` and `--height` (vanilla's own arguments): the window's
     /// starting size, 1280x720 by default.
     window_size: [u32; 2],
@@ -582,7 +587,13 @@ impl Options {
         };
         // The launcher's account: online-mode servers need it. A bad file
         // only leaves the game offline.
-        let session = if o.session_stdin {
+        // ONYX fork: a --build-pack-cache run never signs in, and it
+        // must not consume the one-shot session file (or the session on
+        // stdin) that a following real launch with the same arguments
+        // still needs.
+        let session = if o.build_pack_cache {
+            Ok(None)
+        } else if o.session_stdin {
             let mut text = String::new();
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
                 .map_err(|e| e.to_string())
@@ -667,6 +678,7 @@ impl Options {
             control: None,
             offscreen: false,
             headless: false,
+            build_pack_cache: false,
             window_size: [1280, 720],
             spikes: std::env::var("HORIZON_SPIKES")
                 .ok()
@@ -690,7 +702,7 @@ impl Options {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
-                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --transfers SETTINGS    A dedicated server takes a proxy's hand-over requests (server.toml [transfer], docs/server.md)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --player-dir DIR        This player's own files when several play in one game folder: options.txt, logs, horizon-player.txt, servers.dat, screenshots\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
+                        "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..128 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --transfers SETTINGS    A dedicated server takes a proxy's hand-over requests (server.toml [transfer], docs/server.md)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --session-stdin         The same account as JSON on standard input\n  --game-dir DIR          Game folder: saves, options.txt, packs, mods (default: the working directory)\n  --home DIR              Logs and crash reports (default $HORIZON_HOME, else the platform data folder)\n  --player-dir DIR        This player's own files when several play in one game folder: options.txt, logs, horizon-player.txt, servers.dat, screenshots\n  --fullscreen            Open the window fullscreen\n  --launch-api            Print the Launch API version and options as JSON (docs/api/launch.md)\n  --dev-mod PATH          A content mod (.hmod or folder) to develop: always on\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n  --build-pack-cache      Build the resource pack cache for the saved selection, print its root and quit\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
                         horizon_core::VANILLA_VERSION
                     );
                     return Ok(None);
@@ -714,6 +726,8 @@ impl Options {
                     o.headless = true;
                     o.offscreen = true;
                 }
+                // ONYX fork: see `build_pack_cache` on the struct.
+                "--build-pack-cache" => o.build_pack_cache = true,
                 "--control" => o.control = Some(horizon_client::control::default_path()),
                 // Single player always runs on its server thread: a launcher's saved arguments
                 // may still name the old switches.
@@ -20407,7 +20421,9 @@ impl Progress {
 /// output stays byte-identical; only an ordinary launch shows the window first.
 fn synchronous_startup(options: &Options) -> bool {
     // A headless game has no window for the loading screen.
+    // ONYX fork: a --build-pack-cache run is headless pre-warm work.
     options.headless
+        || options.build_pack_cache
         || options.frames.is_some()
         || options.world_frames.is_some()
         || options.benchmark.is_some()
@@ -22204,6 +22220,18 @@ pub fn run_with() -> Result<()> {
         if let Err(e) = horizon_client::multiplayer::add_partner_servers(&player_dir) {
             log::warn!("could not add the partner servers to servers.dat: {e}");
         }
+    }
+    // ONYX fork: --build-pack-cache pre-warms the pack overlay for the
+    // saved selection and exits here — before components, the narrator,
+    // Discord and any window work — with the same `startup_root` call
+    // the synchronous startup below makes, on the same inputs (the
+    // prepared resources from --resources, the game folder's saved
+    // selection). Nothing is written to options.txt.
+    if options.build_pack_cache {
+        let settings = Settings::load(&Game::options_path());
+        let root = packs::startup_root(&vanilla_root, &settings.resource_packs, &[])?;
+        println!("Horizon: resource pack cache ready: {}", root.display());
+        return Ok(());
     }
     mods::register_components(&vanilla_root)?;
     mods::register_standalone_models();
