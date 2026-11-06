@@ -1179,8 +1179,7 @@ impl Loading {
             self.boot_frame_at = Some(now);
             let target = self.progress.fraction();
             let step = 1.0 - (-dt * 3.5).exp();
-            self.boot_shown =
-                (self.boot_shown + (target - self.boot_shown) * step).min(target);
+            self.boot_shown = (self.boot_shown + (target - self.boot_shown) * step).min(target);
             if target - self.boot_shown < 0.001 {
                 self.boot_shown = target;
             }

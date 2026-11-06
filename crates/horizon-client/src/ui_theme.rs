@@ -603,7 +603,8 @@ fn boot_layout(ui: &Ui) -> BootLayout {
     let size = (ui.w / 16.0).clamp(DISPLAY, 96.0);
     let small = (size * 0.25).clamp(MICRO, 18.0);
     let mark = ui.measure(Face::SemiBold, size, "ONYX");
-    let total = size * 1.45 + small * 0.6 + small * 1.5 + size * 0.55 + BOOT_BAR + 9.0 + MICRO * 1.5;
+    let total =
+        size * 1.45 + small * 0.6 + small * 1.5 + size * 0.55 + BOOT_BAR + 9.0 + MICRO * 1.5;
     let top = (ui.h - total) / 2.0;
     let sub_y = top + size * 1.45 + small * 0.6;
     let bar_y = sub_y + small * 1.5 + size * 0.55;
@@ -631,7 +632,14 @@ fn wordmark(atlas: &HudAtlas, batch: &mut HudBatch, elapsed: Duration) {
     let glow = color::with_alpha(BOOT_GLOW, 0.10 + 0.14 * pulse);
     let d = (l.size * 0.022).max(1.5);
     for (dx, dy) in [(-d, 0.0), (d, 0.0), (0.0, d)] {
-        ui.text(Face::SemiBold, l.size, l.left + dx, l.top + dy, glow, "ONYX");
+        ui.text(
+            Face::SemiBold,
+            l.size,
+            l.left + dx,
+            l.top + dy,
+            glow,
+            "ONYX",
+        );
     }
     ui.text(Face::SemiBold, l.size, l.left, l.top, BOOT_TEXT, "ONYX");
     text_tracked_right(
@@ -704,11 +712,25 @@ fn boot_progress(
         // The fill's soft leading edge, a translucent ice plate just past it.
         let pulse = 0.5 + 0.5 * (elapsed.as_secs_f32() * 2.2).sin();
         let glow = color::with_alpha(BOOT_GLOW, 0.14 + 0.10 * pulse);
-        ui.rounded(l.left - 0.5, l.bar_y - 1.5, fill_w + 3.0, BOOT_BAR + 3.0, 4.0, glow);
+        ui.rounded(
+            l.left - 0.5,
+            l.bar_y - 1.5,
+            fill_w + 3.0,
+            BOOT_BAR + 3.0,
+            4.0,
+            glow,
+        );
     }
     ui.rounded(l.left, l.bar_y, w, BOOT_BAR, 3.0, BOOT_TRACK);
     if fill_w > 0.0 {
-        ui.rounded(l.left + 1.0, l.bar_y + 1.0, fill_w, BOOT_BAR - 2.0, 2.0, BOOT_ICE);
+        ui.rounded(
+            l.left + 1.0,
+            l.bar_y + 1.0,
+            fill_w,
+            BOOT_BAR - 2.0,
+            2.0,
+            BOOT_ICE,
+        );
         // The fill runs to white at its leading edge.
         let seg = fill_w.min(16.0);
         ui.rounded(

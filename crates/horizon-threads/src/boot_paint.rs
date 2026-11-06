@@ -265,7 +265,13 @@ pub fn paint(
         }
         fill(left, bar_y, right, bar_y + bar_h, TRACK);
         if fill_w > 0.0 {
-            fill(left + 1.0, bar_y + 1.0, left + 1.0 + fill_w, bar_y + bar_h - 1.0, ICE);
+            fill(
+                left + 1.0,
+                bar_y + 1.0,
+                left + 1.0 + fill_w,
+                bar_y + bar_h - 1.0,
+                ICE,
+            );
             let seg = fill_w.min(16.0 * density);
             fill(
                 left + 1.0 + fill_w - seg,
