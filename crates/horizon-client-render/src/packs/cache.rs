@@ -316,7 +316,12 @@ fn lock_path(out: &Path) -> PathBuf {
     marker_path(out).with_extension("lock")
 }
 
-pub(super) fn build(vanilla: &Path, packs: &[Pack], out: &Path) -> io::Result<()> {
+pub(super) fn build(
+    vanilla: &Path,
+    packs: &[Pack],
+    out: &Path,
+    progress: Option<&super::ProgressSink>,
+) -> io::Result<()> {
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
@@ -344,6 +349,10 @@ pub(super) fn build(vanilla: &Path, packs: &[Pack], out: &Path) -> io::Result<()
         }
         && out.is_dir()
     {
+        // ONYX fork: a cache hit is the whole build, already done.
+        if let Some(sink) = progress {
+            sink(1.0);
+        }
         return Ok(());
     }
     // ONYX fork: build beside the live overlay and swap the finished
@@ -369,7 +378,7 @@ pub(super) fn build(vanilla: &Path, packs: &[Pack], out: &Path) -> io::Result<()
         vanilla: vanilla_key.clone(),
         ..Dependencies::default()
     };
-    build_overlay_uncached(vanilla, packs, &building, &mut dependencies)?;
+    build_overlay_uncached(vanilla, packs, &building, &mut dependencies, progress)?;
     if out.exists() {
         fs::remove_dir_all(out)?;
     }
@@ -468,6 +477,7 @@ mod tests {
                 selected,
                 &self.0.join("reference"),
                 &mut Dependencies::default(),
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -1046,6 +1056,7 @@ mod tests {
             std::slice::from_ref(&pack),
             &reference,
             &mut Dependencies::default(),
+            None,
         )
         .unwrap();
         for root in [&out, &reference] {
@@ -1081,8 +1092,14 @@ mod tests {
         let mut building_name = out.as_os_str().to_os_string();
         building_name.push(".building");
         let building = PathBuf::from(building_name);
-        build_overlay_uncached(&vanilla, selected, &building, &mut Dependencies::default())
-            .unwrap();
+        build_overlay_uncached(
+            &vanilla,
+            selected,
+            &building,
+            &mut Dependencies::default(),
+            None,
+        )
+        .unwrap();
         // One finished entry is the pack's texture (a link on unix);
         // another is a written merged file, carrying a sentinel time.
         #[cfg(unix)]
@@ -1135,6 +1152,7 @@ mod tests {
             selected,
             &f.0.join("reference"),
             &mut Dependencies::default(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1163,7 +1181,8 @@ mod tests {
                 (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
             });
             let out = cache.join(format!("{hash:016x}"));
-            build_overlay_uncached(vanilla, packs, &out, &mut Dependencies::default()).unwrap();
+            build_overlay_uncached(vanilla, packs, &out, &mut Dependencies::default(), None)
+                .unwrap();
             out
         }
         let median = |mut times: Vec<f64>| {

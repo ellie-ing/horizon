@@ -701,7 +701,18 @@ fn linked_whole(_: &Path, _: &Path) -> bool {
 /// Build `out` as `vanilla` with the packs' files layered on top (packs in
 /// load order, last wins). Untouched directories are links into vanilla.
 pub fn build_overlay(vanilla: &Path, packs: &[Pack], out: &Path) -> io::Result<()> {
-    cache::build(vanilla, packs, out)
+    build_overlay_with_progress(vanilla, packs, out, None)
+}
+
+/// [`build_overlay`], with the build's mirror jobs reporting into
+/// `progress` (see [`ProgressSink`]).
+pub fn build_overlay_with_progress(
+    vanilla: &Path,
+    packs: &[Pack],
+    out: &Path,
+    progress: Option<&ProgressSink>,
+) -> io::Result<()> {
+    cache::build(vanilla, packs, out, progress)
 }
 
 /// ONYX fork: one unit of overlay work. The mirror walk plans the jobs
@@ -826,6 +837,7 @@ fn build_overlay_uncached(
     packs: &[Pack],
     out: &Path,
     dependencies: &mut cache::Dependencies,
+    progress: Option<&ProgressSink>,
 ) -> io::Result<()> {
     // ONYX fork: an existing tree is a previous attempt's partial work
     // (the cache builds into a sibling tree and swaps it in only when
@@ -1070,10 +1082,23 @@ fn build_overlay_uncached(
     // The planned work runs on every thread; results come back in job
     // order, so the first error is the one the sequential build would
     // have stopped at, and the recorders absorb in the walk's order.
+    // ONYX fork: each finished job also counts toward the boot screen's
+    // fraction of the build, reported in ~0.5% steps so a ~10⁴-job build
+    // does not call the sink per job.
     let plain = &*dependencies;
+    let total = jobs.len();
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let reported = std::sync::atomic::AtomicUsize::new(0);
     let results = crate::par::par_map(&jobs, |job| {
         let mut recorded = plain.recorder();
         let result = run_job(job, &zips, resume, &mut recorded);
+        if let Some(sink) = progress {
+            let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let step = n * 200 / total.max(1);
+            if reported.fetch_max(step, std::sync::atomic::Ordering::Relaxed) < step {
+                sink(n as f32 / total.max(1) as f32);
+            }
+        }
         (result, recorded)
     });
     let mut first_error = None;
@@ -1206,8 +1231,25 @@ pub fn enabled(all: &[Pack], ids: &[String]) -> Vec<Pack> {
 pub fn able_to_clear_any_pack(all: &[Pack], selected: &[String]) -> bool {
     !enabled(all, selected).is_empty()
 }
+/// ONYX fork: reports an overlay build's progress as a fraction of its
+/// mirror jobs (0 at the first job, 1 when the last one lands), for the
+/// boot screen's bar. Called from the build's worker threads; reports
+/// are throttled to ~200 steps and may arrive out of order, so the sink
+/// must tolerate that (the game's is a monotonic max).
+pub type ProgressSink = std::sync::Arc<dyn Fn(f32) + Send + Sync>;
+
 /// Resource root for a pack selection: vanilla itself when no pack is on.
 pub fn resource_root(vanilla: &Path, packs: &[Pack], cache: &Path) -> io::Result<PathBuf> {
+    resource_root_with_progress(vanilla, packs, cache, None)
+}
+
+/// [`resource_root`], with the overlay build reporting into `progress`.
+pub fn resource_root_with_progress(
+    vanilla: &Path,
+    packs: &[Pack],
+    cache: &Path,
+    progress: Option<&ProgressSink>,
+) -> io::Result<PathBuf> {
     if packs.is_empty() {
         return Ok(vanilla.to_path_buf());
     }
@@ -1220,7 +1262,7 @@ pub fn resource_root(vanilla: &Path, packs: &[Pack], cache: &Path) -> io::Result
         (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
     });
     let out = cache.join(format!("{hash:016x}"));
-    build_overlay(vanilla, packs, &out)?;
+    build_overlay_with_progress(vanilla, packs, &out, progress)?;
     Ok(out)
 }
 

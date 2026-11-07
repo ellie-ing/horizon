@@ -71,9 +71,6 @@ pub(crate) mod color {
 /// The launcher's type scale and shapes (`horizon_theme`), in dp.
 pub(crate) const SMALL: f32 = horizon_theme::CAPTION.px;
 pub(crate) const BODY: f32 = horizon_theme::LABEL.px;
-/// The boot screen's wordmark (`DISPLAY`) and console lines (`MICRO`).
-pub(crate) const DISPLAY: f32 = horizon_theme::DISPLAY.px;
-pub(crate) const MICRO: f32 = horizon_theme::MICRO.px;
 /// Fields; plates (hover rows, selection); pills (buttons, segments).
 pub(crate) const RADIUS: f32 = horizon_theme::RADIUS;
 pub(crate) const RADIUS_PLATE: f32 = horizon_theme::RADIUS_PLATE;
@@ -534,44 +531,1089 @@ impl<'a> Ui<'a> {
 }
 
 // ---- the boot screen ----
+//
+// ONYX fork: the boot screen is the v2 ONYX loading design, drawn in
+// code: a pure black field, a shimmering starfield, a diamond outline
+// with light travelling its edges, the ONYX wordmark as polished black
+// onyx cut by a slit of light with HORIZON CLIENT inside it, and a plain
+// white progress bar near the bottom. No console text, no stage line, no
+// percentage: the design has none. The layout is the mock's 1920x1080
+// design space mapped onto the window (`Ui` dp), so every window size
+// keeps the design's proportions. The GDI boot paint
+// (`horizon_threads::boot_paint`) mirrors the same proportions
+// statically, so the painted frame and the first wgpu frame agree.
+//
+// When the loader finishes, `draw_boot` is called with `finish` set and
+// plays the finish sequence (see `boot_phase`): the bar flashes and
+// fades out completely, only then the lockup bounces with its
+// afterimages, then everything fades to the pure black the title takes
+// over from.
 
-/// The boot screen's palette on the pure black: a white wordmark and dimmed
-/// console lines (the theme's ink is for light pages).
-const BOOT_TEXT: u32 = color::hex(0xFFFFFF, 255);
-const BOOT_LOG: u32 = color::hex(0x9BA1A6, 255);
-// ONYX fork: the boot screen is the ONYX loading screen, the launcher's: an
-// ice-blue accent whose bar fill runs to white at its leading edge, and the
-// same blue translucent for the wordmark's glow — the HUD has no blur or
-// gradient, so the glow is offset under-draws of the wordmark and the
-// gradient a brighter final segment of the fill.
-const BOOT_ICE: u32 = color::hex(0xBCD6FF, 255);
-const BOOT_GLOW: u32 = color::hex(0x8CB4FF, 255);
-/// The wordmark's sub-line, a muted ice blue-grey.
-const BOOT_SUB: u32 = color::hex(0x9FB4D8, 255);
-/// The progress meta row under the bar, dimmed white.
-const BOOT_DIM: u32 = color::hex(0xFFFFFF, 140);
-/// The bar's track, white barely over the black, and its thin border.
-const BOOT_TRACK: u32 = color::hex(0xFFFFFF, 16);
-const BOOT_BORDER: u32 = color::hex(0xBCD6FF, 90);
-/// The progress bar's height in dp.
-const BOOT_BAR: f32 = 6.0;
+/// The finish sequence's whole length; `Loading` withholds the handoff
+/// for exactly this long once it starts the sequence.
+pub const BOOT_SEQ_TOTAL: Duration = Duration::from_millis(3600);
+/// The bar is fully faded out at this sequence time...
+const BOOT_BAR_END: f32 = 0.80;
+/// ...and only here does the bounce begin: the two never overlap.
+const BOOT_BOUNCE_AT: f32 = 0.95;
+const BOOT_BOUNCE_LEN: f32 = 1.15;
+const BOOT_FADE_AT: f32 = BOOT_BOUNCE_AT + 1.30;
+const BOOT_STAR_FADE_AT: f32 = BOOT_FADE_AT + 0.15;
+/// The slit's half height as a fraction of the wordmark's font size (the
+/// design cuts 139..201 of its 340px wordmark box, about its centre).
+const BOOT_SLIT_HALF: f32 = 0.0912;
 
-/// The boot screen while the menu is not ready yet: the ONYX wordmark
-/// centred on pure black, the loader's progress under it and the console's
-/// last lines at the bottom left, as the terminal prints them. `fraction`
-/// is the bar's displayed fraction: the caller eases it toward the loader's
-/// stage fraction, so the bar never claims more than the loader has
-/// reached. `elapsed` drives the glow's gentle pulse.
+fn ease_out(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    1.0 - (1.0 - x).powi(3)
+}
+
+/// A CSS fade-in: 0 before `at`, eased to 1 over `dur`.
+fn ramp_in(et: f32, at: f32, dur: f32) -> f32 {
+    ease_out((et - at) / dur)
+}
+
+/// Piecewise-linear keyframes over `(time, value)` pairs, clamped at
+/// both ends.
+fn keys_at(keys: &[(f32, f32)], t: f32) -> f32 {
+    if t <= keys[0].0 {
+        return keys[0].1;
+    }
+    for w in keys.windows(2) {
+        if t <= w[1].0 {
+            return w[0].1 + (w[1].1 - w[0].1) * ((t - w[0].0) / (w[1].0 - w[0].0));
+        }
+    }
+    keys[keys.len() - 1].1
+}
+
+/// One element's bounce at sequence time `t`: the design's keyframe
+/// shape as `(u, scale, dy)` triples (dy in design px), run over
+/// `BOOT_BOUNCE_LEN` from `start`. Before the bounce the element rests;
+/// after it, it keeps its final keyframe until the fade takes it.
+fn bounce_at(keys: &[(f32, f32, f32)], start: f32, t: f32) -> (f32, f32) {
+    let u = (t - start) / BOOT_BOUNCE_LEN;
+    if u <= 0.0 {
+        return (1.0, 0.0);
+    }
+    if u >= 1.0 {
+        let k = keys[keys.len() - 1];
+        return (k.1, k.2);
+    }
+    for w in keys.windows(2) {
+        if u <= w[1].0 {
+            let f = (u - w[0].0) / (w[1].0 - w[0].0);
+            return (
+                w[0].1 + (w[1].1 - w[0].1) * f,
+                w[0].2 + (w[1].2 - w[0].2) * f,
+            );
+        }
+    }
+    let k = keys[keys.len() - 1];
+    (k.1, k.2)
+}
+
+const LOGO_BOUNCE: [(f32, f32, f32); 5] = [
+    (0.0, 1.0, 0.0),
+    (0.28, 1.065, -7.0),
+    (0.52, 0.982, 1.0),
+    (0.74, 1.022, -2.0),
+    (1.0, 1.008, 0.0),
+];
+const GEM_BOUNCE: [(f32, f32, f32); 5] = [
+    (0.0, 1.0, 0.0),
+    (0.30, 1.028, 0.0),
+    (0.55, 0.994, 0.0),
+    (0.78, 1.010, 0.0),
+    (1.0, 1.003, 0.0),
+];
+const TAG_BOUNCE: [(f32, f32, f32); 5] = [
+    (0.0, 1.0, 0.0),
+    (0.30, 1.045, 0.0),
+    (0.55, 0.990, 0.0),
+    (0.78, 1.012, 0.0),
+    (1.0, 1.004, 0.0),
+];
+/// The afterimage ghosts: (delay after the bounce starts, duration,
+/// peak alpha, final scale). Their colours are white, periwinkle and
+/// blue, in this order.
+const BOOT_GHOSTS: [(f32, f32, f32, f32); 3] = [
+    (0.0, 1.0, 0.5, 1.13),
+    (0.1, 1.1, 0.3, 1.25),
+    (0.2, 1.2, 0.16, 1.39),
+];
+
+/// Where every animated piece of the boot screen is at one instant: the
+/// finish sequence's state, computed purely from its elapsed time so the
+/// ordering (bar gone before the bounce, ghosts inside the bounce,
+/// black at the end) is testable without a window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct BootPhase {
+    /// The bar's opacity: 1 while loading and while the bar holds at
+    /// 100%, 0 from `BOOT_BAR_END` on.
+    pub bar_alpha: f32,
+    /// The bar's one brightness flash, peaking at 0.15s.
+    pub bar_flash: f32,
+    /// The bar's downward drift (design px) as it fades.
+    pub bar_drop: f32,
+    pub logo_scale: f32,
+    /// Vertical offsets in design px.
+    pub logo_dy: f32,
+    pub gem_scale: f32,
+    pub gem_dy: f32,
+    pub tag_scale: f32,
+    pub tag_dy: f32,
+    /// The three ghosts as (alpha, scale); alpha 0 = not present.
+    pub ghosts: [(f32, f32); 3],
+    /// The whole lockup's fade: 1 = fully shown.
+    pub fade: f32,
+    /// The starfield's own, later fade.
+    pub star_fade: f32,
+    pub halo_fade: f32,
+    /// The sequence has played out: nothing but the black field.
+    pub done: bool,
+}
+
+impl BootPhase {
+    /// The state while loading (no sequence running).
+    const NEUTRAL: Self = Self {
+        bar_alpha: 1.0,
+        bar_flash: 0.0,
+        bar_drop: 0.0,
+        logo_scale: 1.0,
+        logo_dy: 0.0,
+        gem_scale: 1.0,
+        gem_dy: 0.0,
+        tag_scale: 1.0,
+        tag_dy: 0.0,
+        ghosts: [(0.0, 1.0); 3],
+        fade: 1.0,
+        star_fade: 1.0,
+        halo_fade: 1.0,
+        done: false,
+    };
+}
+
+/// The finish sequence at `finish` seconds from its trigger (or the
+/// neutral loading state for `None`).
+pub(crate) fn boot_phase(finish: Option<f32>) -> BootPhase {
+    let Some(t) = finish else {
+        return BootPhase::NEUTRAL;
+    };
+    // The bar: holds, flashes bright once (peak 0.15s), then fades out
+    // while dropping; by BOOT_BAR_END it is gone, before anything moves.
+    let fade_u = ease_out((t - 0.15) / (BOOT_BAR_END - 0.15));
+    let bar_alpha = 1.0 - fade_u;
+    let bar_flash = if t <= 0.15 { t / 0.15 } else { 1.0 - fade_u };
+    let (logo_scale, logo_dy) = bounce_at(&LOGO_BOUNCE, BOOT_BOUNCE_AT, t);
+    let (gem_scale, gem_dy) = bounce_at(&GEM_BOUNCE, BOOT_BOUNCE_AT + 0.02, t);
+    let (tag_scale, tag_dy) = bounce_at(&TAG_BOUNCE, BOOT_BOUNCE_AT + 0.04, t);
+    // The fade-out: everything rises slightly and scales a touch as it
+    // goes, the stars starting later and ending last, on pure black.
+    let out_u = ease_out((t - BOOT_FADE_AT) / 1.0);
+    let mut ghosts = [(0.0f32, 1.0f32); 3];
+    for (g, &(delay, dur, peak, target)) in ghosts.iter_mut().zip(&BOOT_GHOSTS) {
+        let u = (t - (BOOT_BOUNCE_AT + delay)) / dur;
+        if (0.0..=1.0).contains(&u) {
+            let a = if u < 0.14 {
+                peak * (u / 0.14)
+            } else {
+                peak * (1.0 - ease_out((u - 0.14) / 0.86))
+            };
+            *g = (a, 1.0 + (target - 1.0) * ease_out(u));
+        }
+    }
+    BootPhase {
+        bar_alpha,
+        bar_flash,
+        bar_drop: 10.0 * fade_u,
+        logo_scale: logo_scale * (1.0 + 0.014 * out_u),
+        logo_dy: logo_dy - 10.0 * out_u,
+        gem_scale: gem_scale * (1.0 + 0.006 * out_u),
+        gem_dy: gem_dy - 6.0 * out_u,
+        tag_scale: tag_scale * (1.0 + 0.006 * out_u),
+        tag_dy: tag_dy - 6.0 * out_u,
+        ghosts,
+        fade: 1.0 - out_u,
+        star_fade: 1.0 - ease_out((t - BOOT_STAR_FADE_AT) / 1.2),
+        halo_fade: 1.0 - ease_out((t - (BOOT_FADE_AT + 0.05)) / 1.3),
+        done: t >= BOOT_SEQ_TOTAL.as_secs_f32(),
+    }
+}
+
+/// A colour in the batch's encoding at a fractional alpha.
+fn boot_rgba(rgb: u32, a: f32) -> u32 {
+    color::hex(rgb, (a.clamp(0.0, 1.0) * 255.0).round() as u8)
+}
+
+/// Deterministic hash noise for the starfield: fixed positions every
+/// frame and every run, no RNG state.
+fn boot_hash(n: u32) -> u32 {
+    let mut x = n.wrapping_mul(0x9E37_79B1);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x85EB_CA6B);
+    x ^= x >> 13;
+    x
+}
+fn boot_unit(n: u32) -> f32 {
+    (boot_hash(n) >> 8) as f32 / 16_777_216.0
+}
+
+/// The design's twinkle curve (its opacity x brightness keyframes),
+/// normalised so the brightest point is 1: an uneven flicker, not a
+/// smooth pulse.
+fn boot_twinkle(u: f32) -> f32 {
+    const KEYS: [(f32, f32); 8] = [
+        (0.0, 0.874),
+        (0.12, 0.286),
+        (0.26, 1.0),
+        (0.40, 0.204),
+        (0.56, 0.941),
+        (0.72, 0.351),
+        (0.86, 0.698),
+        (1.0, 0.874),
+    ];
+    keys_at(&KEYS, u.rem_euclid(1.0))
+}
+
+/// The wordmark's placement, shared by the pieces that hang off it (the
+/// diamond's slit, the seam, the tag): its centre and font size in dp,
+/// and the slit's y range in dp.
+struct BootMark {
+    cx: f32,
+    cy: f32,
+    size: f32,
+    slit: (f32, f32),
+}
+
+fn boot_mark(ui: &Ui) -> BootMark {
+    let sx = ui.w / 1920.0;
+    let sy = ui.h / 1080.0;
+    // The design's wordmark spans ~61.5% of the width; size the font by
+    // its measured advance so the span holds at any window size.
+    let size = 0.615 * ui.w * 100.0 / ui.measure(Face::SemiBold, 100.0, "ONYX").max(1.0);
+    let cy = 480.0 * sy;
+    BootMark {
+        cx: ui.w / 2.0 - 8.0 * sx,
+        cy,
+        size,
+        slit: (cy - size * BOOT_SLIT_HALF, cy + size * BOOT_SLIT_HALF),
+    }
+}
+
+/// Scale the vertices drawn since `start` about a centre given in dp,
+/// with an extra vertical offset in dp: the batch-space form of one
+/// element's transform.
+fn boot_xf(ui: &mut Ui, start: usize, centre: (f32, f32), scale: f32, dy: f32) {
+    let k = ui.density / ui.scale;
+    ui.batch
+        .scale_since(start, centre.0 * k, centre.1 * k, scale, scale);
+    if dy != 0.0 {
+        for v in &mut ui.batch.vertices[start..] {
+            v.pos[1] += dy * k;
+        }
+    }
+}
+
+/// Rewrite the colours of the vertices in `range` from their position
+/// (in dp): the wordmark's gradient is a function of height, its sheen
+/// of x.
+fn boot_recolour(ui: &mut Ui, range: std::ops::Range<usize>, f: impl Fn(f32, f32) -> u32) {
+    let k = ui.density / ui.scale;
+    for v in &mut ui.batch.vertices[range] {
+        v.color = f(v.pos[0] / k, v.pos[1] / k);
+    }
+}
+
+/// A filled ellipse as a fan of thin quads (the batch has no disc
+/// primitive); 24 segments read smooth at these sizes.
+fn boot_disc(ui: &mut Ui, cx: f32, cy: f32, rx: f32, ry: f32, color: u32) {
+    if color >> 24 == 0 || rx <= 0.0 || ry <= 0.0 {
+        return;
+    }
+    let k = ui.density / ui.scale;
+    let (cx, cy, rx, ry) = (cx * k, cy * k, rx * k, ry * k);
+    let mut prev = [cx + rx, cy];
+    for i in 1..=24 {
+        let a = std::f32::consts::TAU * i as f32 / 24.0;
+        let p = [cx + rx * a.cos(), cy + ry * a.sin()];
+        ui.batch
+            .fill_quad(ui.atlas, [[cx, cy], prev, p, [cx, cy]], color);
+        prev = p;
+    }
+}
+
+/// A thick line segment as one quad, endpoints and width in dp.
+fn boot_line(ui: &mut Ui, a: (f32, f32), b: (f32, f32), width: f32, color: u32) {
+    if color >> 24 == 0 {
+        return;
+    }
+    let k = ui.density / ui.scale;
+    let (ax, ay) = (a.0 * k, a.1 * k);
+    let (bx, by) = (b.0 * k, b.1 * k);
+    let (dx, dy) = (bx - ax, by - ay);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 0.01 {
+        return;
+    }
+    let (nx, ny) = (-dy / len * width * k / 2.0, dx / len * width * k / 2.0);
+    ui.batch.fill_quad(
+        ui.atlas,
+        [
+            [ax + nx, ay + ny],
+            [bx + nx, by + ny],
+            [bx - nx, by - ny],
+            [ax - nx, ay - ny],
+        ],
+        color,
+    );
+}
+
+/// A design-space (1920x1080) point in dp.
+fn boot_point(ui: &Ui, x: f32, y: f32) -> (f32, f32) {
+    (x * ui.w / 1920.0, y * ui.h / 1080.0)
+}
+
+/// One line segment with the slit band cut out of it: the diamond's
+/// lines pass behind the slit, like the wordmark does.
+fn boot_seg(ui: &mut Ui, a: (f32, f32), b: (f32, f32), slit: (f32, f32), width: f32, color: u32) {
+    let mut cuts = [0.0f32, 1.0, 0.0, 0.0];
+    let mut n = 2;
+    if (b.1 - a.1).abs() > f32::EPSILON {
+        for bound in [slit.0, slit.1] {
+            let t = (bound - a.1) / (b.1 - a.1);
+            if t > 0.0 && t < 1.0 {
+                cuts[n] = t;
+                n += 1;
+            }
+        }
+    }
+    let mut cuts = cuts[..n].to_vec();
+    cuts.sort_by(f32::total_cmp);
+    for w in cuts.windows(2) {
+        let pa = (a.0 + (b.0 - a.0) * w[0], a.1 + (b.1 - a.1) * w[0]);
+        let pb = (a.0 + (b.0 - a.0) * w[1], a.1 + (b.1 - a.1) * w[1]);
+        let mid = (pa.1 + pb.1) / 2.0;
+        if mid > slit.0 && mid < slit.1 {
+            continue;
+        }
+        boot_line(ui, pa, pb, width, color);
+    }
+}
+
+fn boot_poly(
+    ui: &mut Ui,
+    pts: &[(f32, f32)],
+    closed: bool,
+    slit: (f32, f32),
+    width: f32,
+    color: u32,
+) {
+    for pair in pts.windows(2) {
+        boot_seg(ui, pair[0], pair[1], slit, width, color);
+    }
+    if closed && pts.len() > 2 {
+        boot_seg(ui, *pts.last().unwrap(), pts[0], slit, width, color);
+    }
+}
+
+/// A comet: light travelling a polyline. `head` is the distance the
+/// brightest point has reached along the path; each layer is a trailing
+/// segment (length in thousandths of the path, width in dp, colour,
+/// alpha). The slit cuts the comet like it cuts the lines.
+fn boot_comet(
+    ui: &mut Ui,
+    pts: &[(f32, f32)],
+    closed: bool,
+    head: f32,
+    layers: &[(f32, f32, u32, f32)],
+    slit: (f32, f32),
+) {
+    let mut segs: Vec<((f32, f32), (f32, f32), f32, f32)> = Vec::new();
+    let mut total = 0.0f32;
+    let count = if closed { pts.len() } else { pts.len() - 1 };
+    for i in 0..count {
+        let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+        let len = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+        segs.push((a, b, total, len));
+        total += len;
+    }
+    if total <= 0.0 {
+        return;
+    }
+    for &(len_u, width, rgb, alpha) in layers {
+        if alpha <= 0.0 {
+            continue;
+        }
+        let len = len_u / 1000.0 * total;
+        let mut spans = [(0.0f32, 0.0f32); 2];
+        let nspans = if closed {
+            let h = head.rem_euclid(total);
+            let lo = h - len;
+            if lo < 0.0 {
+                spans = [(0.0, h), (total + lo, total)];
+                2
+            } else {
+                spans[0] = (lo, h);
+                1
+            }
+        } else {
+            spans[0] = ((head - len).max(0.0), head.min(total));
+            1
+        };
+        for &(s0, s1) in &spans[..nspans] {
+            if s1 <= s0 {
+                continue;
+            }
+            for &(a, b, start, seg_len) in &segs {
+                let (o0, o1) = (s0.max(start), s1.min(start + seg_len));
+                if o1 <= o0 || seg_len <= 0.0 {
+                    continue;
+                }
+                let pa = (
+                    a.0 + (b.0 - a.0) * (o0 - start) / seg_len,
+                    a.1 + (b.1 - a.1) * (o0 - start) / seg_len,
+                );
+                let pb = (
+                    a.0 + (b.0 - a.0) * (o1 - start) / seg_len,
+                    a.1 + (b.1 - a.1) * (o1 - start) / seg_len,
+                );
+                boot_seg(ui, pa, pb, slit, width, boot_rgba(rgb, alpha));
+            }
+        }
+    }
+}
+
+/// How far a comet's head has travelled: it sweeps the first `travel`
+/// seconds of its cycle (plus 30% past the end, so the tail clears),
+/// starting after `delay`.
+fn comet_head(et: f32, cycle: f32, delay: f32, travel: f32, total: f32) -> f32 {
+    let lt = et.rem_euclid(cycle);
+    ((lt - delay) / travel).clamp(0.0, 1.0) * 1.3 * total
+}
+
+/// The gem node's flash cycle: (alpha, scale) — a quick flare as a comet
+/// reaches the node, then rest.
+fn gem_flash(et: f32, delay: f32) -> (f32, f32) {
+    let lt = et.rem_euclid(6.5);
+    if lt < delay {
+        return (0.55, 1.0);
+    }
+    let u = (lt - delay) / 6.5;
+    if u < 0.03 {
+        let f = u / 0.03;
+        (0.55 + 0.45 * f, 1.0 + 1.3 * f)
+    } else if u < 0.15 {
+        let f = (u - 0.03) / 0.12;
+        (1.0 - 0.45 * f, 2.3 - 1.3 * f)
+    } else {
+        (0.55, 1.0)
+    }
+}
+
+/// The halo behind the lockup: a soft radial glow, approximated with
+/// layered translucent discs (the HUD has no blur), gently pulsing.
+fn boot_halo(ui: &mut Ui, et: f32, phase: &BootPhase) {
+    let a = phase.fade * phase.halo_fade;
+    if a <= 0.0 {
+        return;
+    }
+    let pulse = 0.825 - 0.175 * (std::f32::consts::TAU * et / 6.0).cos();
+    let (cx, cy) = boot_point(ui, 960.0, 480.0);
+    let (rx, ry) = (ui.w * 840.0 / 1920.0, ui.h * 330.0 / 1080.0);
+    // Eight layers of ~0.013 stack to the design's ~0.10 at the centre.
+    for i in 0..8 {
+        let f = (i as f32 + 1.0) / 8.0;
+        boot_disc(
+            ui,
+            cx,
+            cy,
+            rx * f,
+            ry * f,
+            boot_rgba(0xCDD8FF, 0.0131 * pulse * a),
+        );
+    }
+}
+
+/// The starfield: ~200 stars in six groups of different sizes and
+/// twinkle periods, plus 16 sparkles with cross flares.
+fn boot_stars(ui: &mut Ui, et: f32, phase: &BootPhase) {
+    let ramp = ramp_in(et, 0.0, 1.6) * phase.fade * phase.star_fade;
+    if ramp <= 0.0 {
+        return;
+    }
+    let m = (ui.w / 1920.0).min(ui.h / 1080.0);
+    // (count, size in design px, twinkle period, phase offset)
+    const GROUPS: [(u32, f32, f32, f32); 6] = [
+        (72, 2.0, 5.2, 0.0),
+        (62, 1.0, 5.3, 2.0),
+        (28, 2.0, 3.1, 1.2),
+        (22, 2.0, 4.6, 3.5),
+        (10, 3.0, 2.7, 0.6),
+        (8, 3.0, 4.1, 2.8),
+    ];
+    const ALPHAS: [f32; 6] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+    let mut seed = 0u32;
+    for (count, size, period, off) in GROUPS {
+        for _ in 0..count {
+            seed += 1;
+            let x = boot_unit(seed * 4) * ui.w;
+            let y = boot_unit(seed * 4 + 1) * ui.h;
+            let base = ALPHAS[(boot_hash(seed * 4 + 2) % 6) as usize];
+            let u = (et + off) / period + boot_unit(seed * 4 + 3);
+            let a = base * boot_twinkle(u) * ramp;
+            if a < 0.02 {
+                continue;
+            }
+            let s = (size * m).max(0.6);
+            ui.rounded(
+                x - s / 2.0,
+                y - s / 2.0,
+                s,
+                s,
+                s / 2.0,
+                boot_rgba(0xFFFFFF, a),
+            );
+        }
+    }
+    // The sparkles pulse on the design's sparkle curve: a glow disc, a
+    // bright dot and thin cross arms.
+    const SPARK_A: [(f32, f32); 7] = [
+        (0.0, 0.15),
+        (0.18, 0.9),
+        (0.32, 0.3),
+        (0.55, 1.0),
+        (0.74, 0.35),
+        (0.88, 0.75),
+        (1.0, 0.15),
+    ];
+    const SPARK_S: [(f32, f32); 7] = [
+        (0.0, 0.55),
+        (0.18, 1.05),
+        (0.32, 0.7),
+        (0.55, 1.2),
+        (0.74, 0.75),
+        (0.88, 1.0),
+        (1.0, 0.55),
+    ];
+    for _ in 0..16 {
+        seed += 1;
+        let x = boot_unit(seed * 4) * ui.w;
+        let y = boot_unit(seed * 4 + 1) * ui.h;
+        let size = 3.0 + 3.0 * boot_unit(seed * 4 + 2);
+        let period = 3.2 + 2.0 * boot_unit(seed * 4 + 3);
+        let u = (et / period + boot_unit(seed * 7 + 5)).fract();
+        let a = keys_at(&SPARK_A, u) * ramp;
+        if a < 0.02 {
+            continue;
+        }
+        let sc = keys_at(&SPARK_S, u) * m;
+        boot_disc(
+            ui,
+            x,
+            y,
+            size * 1.1 * sc,
+            size * 1.1 * sc,
+            boot_rgba(0xBECDFF, 0.20 * a),
+        );
+        boot_disc(
+            ui,
+            x,
+            y,
+            size * 0.5 * sc,
+            size * 0.5 * sc,
+            boot_rgba(0xFFFFFF, a),
+        );
+        let arm = 15.0 * sc;
+        let w = (1.5 * m).max(0.4);
+        boot_line(
+            ui,
+            (x - arm, y),
+            (x + arm, y),
+            w,
+            boot_rgba(0xFFFFFF, 0.55 * a),
+        );
+        boot_line(
+            ui,
+            (x, y - arm),
+            (x, y + arm),
+            w,
+            boot_rgba(0xFFFFFF, 0.55 * a),
+        );
+    }
+}
+
+/// Both diamond outline sets (the faint constellation and the brighter
+/// gem), their comets and their vertex nodes, bounced as one group
+/// about the diamond's centre.
+fn boot_diamond(ui: &mut Ui, et: f32, phase: &BootPhase, mark: &BootMark) {
+    if phase.fade <= 0.0 {
+        return;
+    }
+    let sx = ui.w / 1920.0;
+    let sy = ui.h / 1080.0;
+    let m = sx.min(sy);
+    let slit = mark.slit;
+    let start = ui.batch.vertices.len();
+    let const_ramp = ramp_in(et, 0.5, 1.8) * phase.fade;
+    let gem_ramp = ramp_in(et, 0.4, 1.6) * phase.fade;
+    let const_outer = [
+        boot_point(ui, 960.0, 118.0),
+        boot_point(ui, 645.0, 391.0),
+        boot_point(ui, 960.0, 872.0),
+        boot_point(ui, 1275.0, 391.0),
+    ];
+    let const_inner = [
+        boot_point(ui, 960.0, 118.0),
+        boot_point(ui, 822.0, 391.0),
+        boot_point(ui, 960.0, 872.0),
+        boot_point(ui, 1098.0, 391.0),
+    ];
+    let gem_outer = [
+        boot_point(ui, 960.0, 139.0),
+        boot_point(ui, 634.0, 400.0),
+        boot_point(ui, 960.0, 899.0),
+        boot_point(ui, 1286.0, 400.0),
+    ];
+    let gem_inner = [
+        boot_point(ui, 960.0, 139.0),
+        boot_point(ui, 818.0, 400.0),
+        boot_point(ui, 960.0, 899.0),
+        boot_point(ui, 1102.0, 400.0),
+    ];
+    // The constellation: faintest white lines, its own slower comets.
+    let const_col = boot_rgba(0xFFFFFF, 0.28 * const_ramp);
+    boot_poly(ui, &const_outer, true, slit, 1.4 * m, const_col);
+    boot_poly(ui, &const_inner, true, slit, 1.4 * m, const_col);
+    boot_seg(
+        ui,
+        boot_point(ui, 645.0, 391.0),
+        boot_point(ui, 1275.0, 391.0),
+        slit,
+        1.4 * m,
+        const_col,
+    );
+    let total = |pts: &[(f32, f32)], closed: bool| {
+        let n = if closed { pts.len() } else { pts.len() - 1 };
+        (0..n).fold(0.0f32, |acc, i| {
+            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+            acc + ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt()
+        })
+    };
+    let const_layers = [
+        (240.0, 5.0 * m, 0xFFFFFFu32, 0.15 * const_ramp),
+        (240.0, 1.6 * m, 0xFFFFFF, 0.35 * const_ramp),
+        (110.0, 2.4 * m, 0xFFFFFF, 0.6 * const_ramp),
+        (28.0, 3.4 * m, 0xFFFFFF, 1.0 * const_ramp),
+    ];
+    boot_comet(
+        ui,
+        &const_outer,
+        true,
+        comet_head(et, 9.0, 2.2, 4.05, total(&const_outer, true)),
+        &const_layers,
+        slit,
+    );
+    boot_comet(
+        ui,
+        &const_inner,
+        true,
+        comet_head(et, 9.0, 3.6, 4.05, total(&const_inner, true)),
+        &const_layers,
+        slit,
+    );
+    let const_mid = [boot_point(ui, 645.0, 391.0), boot_point(ui, 1275.0, 391.0)];
+    boot_comet(
+        ui,
+        &const_mid,
+        false,
+        comet_head(et, 9.0, 5.0, 4.05, total(&const_mid, false)),
+        &const_layers,
+        slit,
+    );
+    // The gem: brighter periwinkle-white lines, faster comets on every
+    // edge, flashing nodes where the comets land.
+    let gem_col = boot_rgba(0xC9D1F5, 0.5 * gem_ramp);
+    boot_poly(ui, &gem_outer, true, slit, 1.6 * m, gem_col);
+    boot_poly(ui, &gem_inner, true, slit, 1.6 * m, gem_col);
+    boot_seg(
+        ui,
+        boot_point(ui, 634.0, 400.0),
+        boot_point(ui, 1286.0, 400.0),
+        slit,
+        1.6 * m,
+        gem_col,
+    );
+    let gem_layers = [
+        (300.0, 6.0 * m, 0xD6DEFFu32, 0.12 * gem_ramp),
+        (300.0, 2.2 * m, 0xCFD8FF, 0.28 * gem_ramp),
+        (190.0, 2.4 * m, 0xDBE1FF, 0.45 * gem_ramp),
+        (100.0, 2.8 * m, 0xEEF1FF, 0.70 * gem_ramp),
+        (28.0, 3.2 * m, 0xFFFFFF, 1.0 * gem_ramp),
+    ];
+    let (top, left, right, bottom) = (gem_outer[0], gem_outer[1], gem_outer[3], gem_outer[2]);
+    let (in_l, in_r) = (gem_inner[1], gem_inner[3]);
+    for path in [
+        [top, left, bottom],
+        [top, in_l, bottom],
+        [top, right, bottom],
+        [top, in_r, bottom],
+    ] {
+        boot_comet(
+            ui,
+            &path,
+            false,
+            comet_head(et, 6.5, 1.8, 2.99, total(&path, false)),
+            &gem_layers,
+            slit,
+        );
+    }
+    let gem_mid = [left, right];
+    boot_comet(
+        ui,
+        &gem_mid,
+        false,
+        comet_head(et, 6.5, 2.75, 2.99, total(&gem_mid, false)),
+        &gem_layers,
+        slit,
+    );
+    // Constellation nodes: a halo disc and a twinkling dot.
+    for (x, y, off) in [
+        (960.0, 118.0, -0.5),
+        (645.0, 391.0, -1.7),
+        (1275.0, 391.0, -2.6),
+        (960.0, 872.0, -3.4),
+        (822.0, 391.0, -1.1),
+        (1098.0, 391.0, -2.2),
+    ] {
+        let (x, y) = boot_point(ui, x, y);
+        let tw = 0.35 + 0.65 * boot_twinkle(et / 4.2 + off);
+        boot_disc(
+            ui,
+            x,
+            y,
+            11.0 * sx,
+            11.0 * sy,
+            boot_rgba(0xFFFFFF, 0.10 * tw * const_ramp),
+        );
+        boot_disc(
+            ui,
+            x,
+            y,
+            3.4 * m,
+            3.4 * m,
+            boot_rgba(0xFFFFFF, tw * const_ramp),
+        );
+    }
+    // Gem nodes: a dot with a cross flare, flashing as the comets pass.
+    for (x, y, delay, cross) in [
+        (960.0, 139.0, 1.8, true),
+        (634.0, 400.0, 2.75, true),
+        (1286.0, 400.0, 2.75, true),
+        (960.0, 899.0, 4.1, true),
+        (818.0, 400.0, 2.64, false),
+        (1102.0, 400.0, 2.64, false),
+    ] {
+        let (x, y) = boot_point(ui, x, y);
+        let (fa, fs) = gem_flash(et, delay);
+        let a = fa * gem_ramp;
+        boot_disc(ui, x, y, 3.6 * m, 3.6 * m, boot_rgba(0xFFFFFF, a));
+        if cross {
+            let arm = 16.0 * fs * m;
+            let w = (1.2 * m).max(0.4);
+            boot_line(ui, (x - arm, y), (x + arm, y), w, boot_rgba(0xFFFFFF, a));
+            boot_line(ui, (x, y - arm), (x, y + arm), w, boot_rgba(0xFFFFFF, a));
+        }
+    }
+    let centre = boot_point(ui, 960.0, 519.0);
+    boot_xf(ui, start, centre, phase.gem_scale, phase.gem_dy * sy);
+}
+
+/// The wordmark drawn once, clipped to outside the slit; returns the
+/// vertex range the draw produced.
+fn boot_text_clipped(
+    ui: &mut Ui,
+    size: f32,
+    x: f32,
+    y: f32,
+    color: u32,
+    clip: (f32, f32, f32, f32),
+) -> std::ops::Range<usize> {
+    let start = ui.batch.vertices.len();
+    ui.text_line(Face::SemiBold, size, size, x, y, color, "ONYX");
+    ui.batch.clip_since(start, clip.0, clip.1, clip.2, clip.3);
+    start..ui.batch.vertices.len()
+}
+
+/// The ONYX wordmark as polished black onyx: a soft vertical gradient
+/// with faint stone banding (painted into the glyph vertices by height),
+/// a blurred periwinkle bloom behind it, a light sweep clipped to the
+/// letters, and the slit cut through all of it.
+fn boot_wordmark(ui: &mut Ui, et: f32, phase: &BootPhase, mark: &BootMark) {
+    let sx = ui.w / 1920.0;
+    let sy = ui.h / 1080.0;
+    let k = ui.density / ui.scale;
+    let (cx, cy, size) = (mark.cx, mark.cy, mark.size);
+    // The glyph cache's shelf packing cannot hold four wordmark glyphs
+    // rasterised at full size in the boot atlas (its text region is half
+    // the GUI atlas'), so rasterise under a cap and let the group
+    // transform below scale the quads up to the true size.
+    let cap = if ui.atlas.width <= 1024 { 340.0 } else { 470.0 };
+    let draw = size.min(cap / ui.density);
+    let upscale = size / draw;
+    let w_draw = ui.measure(Face::SemiBold, draw, "ONYX");
+    let (x, y) = (cx - w_draw / 2.0, cy - draw / 2.0);
+    let rise = ramp_in(et, 0.25, 1.3);
+    let alpha = rise * phase.fade;
+    let above = (0.0, 0.0, ui.batch.width, mark.slit.0 * k);
+    let below = (0.0, mark.slit.1 * k, ui.batch.width, ui.batch.height);
+    let group = ui.batch.vertices.len();
+    // The bloom: offset copies in periwinkle, clipped out of the slit,
+    // then scaled a touch larger about the centre.
+    let bloom = boot_rgba(0xD5DCFF, 0.11 * alpha);
+    for (dx, dy) in [(-2.2 * sx, 2.0 * sy), (2.2 * sx, 2.0 * sy), (0.0, 4.2 * sy)] {
+        for clip in [above, below] {
+            boot_text_clipped(ui, draw, x + dx, y + dy, bloom, clip);
+        }
+    }
+    ui.batch.scale_since(group, cx * k, cy * k, 1.012, 1.012);
+    // The ghosts (finish sequence only): flat copies expanding about
+    // the centre, slit-masked like the wordmark.
+    for (gi, &(ga, gs)) in phase.ghosts.iter().enumerate() {
+        if ga <= 0.0 {
+            continue;
+        }
+        const GHOST_COLS: [u32; 3] = [0xFFFFFF, 0xBCC9FF, 0x8EA2FF];
+        let start = ui.batch.vertices.len();
+        let col = boot_rgba(GHOST_COLS[gi], ga * alpha);
+        for clip in [above, below] {
+            boot_text_clipped(ui, draw, x, y, col, clip);
+        }
+        ui.batch.scale_since(start, cx * k, cy * k, gs, gs);
+    }
+    // The wordmark itself, drawn white; the gradient is painted over
+    // its vertices by height below.
+    let main = boot_text_clipped(ui, draw, x, y, color::hex(0xFFFFFF, 255), above);
+    let main2 = boot_text_clipped(ui, draw, x, y, color::hex(0xFFFFFF, 255), below);
+    // The sheen: a bright band sweeping the letters once per 7.5s cycle,
+    // its falloff painted by x.
+    let sheen = boot_text_clipped(ui, draw, x, y, color::hex(0xFFFFFF, 255), above);
+    let sheen2 = boot_text_clipped(ui, draw, x, y, color::hex(0xFFFFFF, 255), below);
+    let top = cy - size / 2.0;
+    let paint = |_px: f32, py: f32| {
+        let fy = cy + (py - cy) * upscale;
+        boot_onyx_colour((fy - top) / size, alpha)
+    };
+    boot_recolour(ui, main, paint);
+    boot_recolour(ui, main2, paint);
+    let w_full = w_draw * upscale;
+    let cycle = et - 2.2;
+    let sheen_u = (cycle.rem_euclid(7.5)) / 2.85;
+    let sheen_on = cycle >= 0.0 && cycle.rem_euclid(7.5) < 2.85;
+    let paint_sheen = |px: f32, _py: f32| {
+        if !sheen_on {
+            return color::hex(0xFFFFFF, 0);
+        }
+        let frac = (px - (cx - w_full / 2.0)) / w_full.max(1.0);
+        let centre = -0.78 + 4.16 * sheen_u;
+        let a = 0.34 * 0.9 * (1.0 - (frac - centre).abs() / 0.312).clamp(0.0, 1.0) * alpha;
+        boot_rgba(0xFFFFFF, a)
+    };
+    boot_recolour(ui, sheen, paint_sheen);
+    boot_recolour(ui, sheen2, paint_sheen);
+    // The whole lockup group: up to true size, the intro rise, the
+    // bounce and the fade's rise.
+    let intro_dy = 16.0 * sy * (1.0 - rise);
+    boot_xf(
+        ui,
+        group,
+        (cx, cy),
+        upscale * phase.logo_scale,
+        phase.logo_dy * sy + intro_dy,
+    );
+}
+
+/// The polished-onyx colour at height fraction `f` of the wordmark: the
+/// design's soft gradient stops with its faint stone banding composited
+/// over, at the lockup's current alpha.
+fn boot_onyx_colour(f: f32, alpha: f32) -> u32 {
+    const STOPS: [(f32, [f32; 3]); 8] = [
+        (0.0, [253.0, 253.0, 255.0]),
+        (0.188, [238.0, 240.0, 248.0]),
+        (0.388, [216.0, 219.0, 231.0]),
+        (0.494, [194.0, 197.0, 210.0]),
+        (0.629, [166.0, 168.0, 182.0]),
+        (0.788, [131.0, 133.0, 143.0]),
+        (0.947, [91.0, 92.0, 102.0]),
+        (1.0, [74.0, 75.0, 84.0]),
+    ];
+    let f = f.clamp(0.0, 1.0);
+    let mut rgb = STOPS[STOPS.len() - 1].1;
+    for w in STOPS.windows(2) {
+        if f <= w[1].0 {
+            let t = (f - w[0].0) / (w[1].0 - w[0].0);
+            rgb = std::array::from_fn(|i| w[0].1[i] + (w[1].1[i] - w[0].1[i]) * t);
+            break;
+        }
+    }
+    let (over, a): ([f32; 3], f32) = if f < 0.0706 {
+        ([255.0, 255.0, 255.0], 0.05)
+    } else if f < 0.147 {
+        ([10.0, 10.0, 18.0], 0.05)
+    } else if f < 0.229 {
+        ([255.0, 255.0, 255.0], 0.04)
+    } else {
+        ([10.0, 10.0, 18.0], 0.04)
+    };
+    let mix = |c: f32, o: f32| (c * (1.0 - a) + o * a).round() as u32;
+    let packed = mix(rgb[0], over[0]) << 16 | mix(rgb[1], over[1]) << 8 | mix(rgb[2], over[2]);
+    boot_rgba(packed, alpha)
+}
+
+/// The seam of light inside the slit: a thin horizontal gradient line,
+/// pulsing slowly.
+fn boot_seam(ui: &mut Ui, et: f32, phase: &BootPhase, mark: &BootMark) {
+    let ramp = ramp_in(et, 1.1, 1.2) * phase.fade;
+    if ramp <= 0.0 {
+        return;
+    }
+    let sx = ui.w / 1920.0;
+    let sy = ui.h / 1080.0;
+    let pulse = 0.70 + 0.25 * (std::f32::consts::TAU * et / 5.0).sin();
+    let (x0, x1) = (300.0 * sx, 1620.0 * sx);
+    let thick = (2.0 * sy).max(0.8);
+    const PROFILE: [(f32, f32); 5] = [(0.0, 0.0), (0.3, 0.4), (0.5, 0.65), (0.7, 0.4), (1.0, 0.0)];
+    for i in 0..24 {
+        let (f0, f1) = (i as f32 / 24.0, (i + 1) as f32 / 24.0);
+        let fm = (f0 + f1) / 2.0;
+        let t = 1.0 - (2.0 * (fm - 0.5)).abs();
+        let mix = |e: f32, c: f32| (e + (c - e) * t).round() as u32;
+        let packed = mix(178.0, 235.0) << 16 | mix(193.0, 240.0) << 8 | mix(255.0, 255.0);
+        let a = keys_at(&PROFILE, fm) * pulse * ramp;
+        ui.rounded(
+            x0 + (x1 - x0) * f0,
+            mark.cy - thick / 2.0,
+            (x1 - x0) / 24.0 + 0.4,
+            thick,
+            thick / 2.0,
+            boot_rgba(packed, a),
+        );
+    }
+}
+
+/// HORIZON CLIENT in the slit: letterspaced mono, periwinkle, with a
+/// soft glow of offset copies. The design centres it ~70 design px left
+/// of centre.
+fn boot_tag(ui: &mut Ui, et: f32, phase: &BootPhase, mark: &BootMark) {
+    let ramp = ramp_in(et, 1.1, 1.2) * phase.fade;
+    if ramp <= 0.0 {
+        return;
+    }
+    let sx = ui.w / 1920.0;
+    let sy = ui.h / 1080.0;
+    let size = 26.0 * sx.min(sy);
+    let text = "HORIZON CLIENT";
+    let tracking = 0.6 * size;
+    let plain: f32 = text
+        .chars()
+        .map(|c| ui.measure(Face::Mono, size, &c.to_string()))
+        .sum();
+    let total = plain + tracking * (text.len() - 1) as f32;
+    let cx = 890.0 * sx;
+    let y = mark.cy - size * 1.45 / 2.0;
+    let start = ui.batch.vertices.len();
+    let draw_tracked = |ui: &mut Ui, dx: f32, dy: f32, color: u32| {
+        let mut x = cx - total / 2.0 + dx;
+        for c in text.chars() {
+            let mut buf = [0u8; 4];
+            let w = ui.measure(Face::Mono, size, &c.to_string());
+            ui.text(Face::Mono, size, x, y + dy, color, c.encode_utf8(&mut buf));
+            x += w + tracking;
+        }
+    };
+    let glow = boot_rgba(0xA4B6FF, 0.16 * ramp);
+    for (dx, dy) in [
+        (-1.5 * sx, 0.0),
+        (1.5 * sx, 0.0),
+        (0.0, -1.5 * sy),
+        (0.0, 1.5 * sy),
+    ] {
+        draw_tracked(ui, dx, dy, glow);
+    }
+    draw_tracked(ui, 0.0, 0.0, boot_rgba(0xC3CCF7, 0.95 * ramp));
+    boot_xf(ui, start, (cx, mark.cy), phase.tag_scale, phase.tag_dy * sy);
+}
+
+/// The progress bar: a thin white border, an inner white fill at the
+/// loader's fraction, a soft glow under it. During the finish sequence
+/// it flashes and fades away (`phase`).
+fn boot_bar(ui: &mut Ui, fraction: f32, et: f32, phase: &BootPhase) {
+    if phase.bar_alpha <= 0.0 {
+        return;
+    }
+    let a = phase.bar_alpha * ramp_in(et, 1.2, 1.0);
+    if a <= 0.0 {
+        return;
+    }
+    let sx = ui.w / 1920.0;
+    let sy = ui.h / 1080.0;
+    let m = sx.min(sy);
+    let (x0, x1) = (0.05 * ui.w, 0.95 * ui.w);
+    let h = 26.0 * sy;
+    let y = ui.h - 88.0 * sy - h + phase.bar_drop * sy;
+    let border = (2.0 * m).max(1.0);
+    let pad = 3.0 * m;
+    let white = boot_rgba(0xFFFFFF, a);
+    if phase.bar_flash > 0.0 {
+        ui.rounded(
+            x0 - 10.0 * sx,
+            y - 10.0 * sy,
+            (x1 - x0) + 20.0 * sx,
+            h + 20.0 * sy,
+            8.0,
+            boot_rgba(0xFFFFFF, 0.25 * phase.bar_flash * a),
+        );
+    }
+    ui.rounded(
+        x0 - 4.0 * sx,
+        y - 4.0 * sy,
+        (x1 - x0) + 8.0 * sx,
+        h + 8.0 * sy,
+        4.0,
+        boot_rgba(0xFFFFFF, (0.10 + 0.5 * phase.bar_flash) * a),
+    );
+    ui.rounded(x0, y, x1 - x0, border, 0.0, white);
+    ui.rounded(x0, y + h - border, x1 - x0, border, 0.0, white);
+    ui.rounded(x0, y, border, h, 0.0, white);
+    ui.rounded(x1 - border, y, border, h, 0.0, white);
+    let fill_w = (x1 - x0 - 2.0 * pad).max(0.0) * fraction.clamp(0.0, 1.0);
+    if fill_w > 0.0 {
+        ui.rounded(
+            x0 + pad,
+            y + pad,
+            fill_w,
+            (h - 2.0 * pad).max(0.0),
+            0.0,
+            white,
+        );
+    }
+}
+
+/// The boot screen while the menu is not ready yet, and again while the
+/// finish sequence plays: the v2 ONYX design on pure black. `fraction`
+/// is the bar's displayed fraction (the caller eases it toward the
+/// loader's real fraction, so it never claims more than has loaded);
+/// `elapsed` drives the ambient animation; `finish`, when set, is the
+/// finish sequence's elapsed time.
 pub fn draw_boot(
     atlas: &HudAtlas,
     batch: &mut HudBatch,
-    logs: &[String],
-    stage: &str,
     fraction: f32,
     elapsed: Duration,
+    finish: Option<Duration>,
 ) {
-    // Pure black under everything: the frame's panorama (the title artwork
-    // once the bundle is in) must not leak through.
+    // Pure black under everything: the frame's panorama (the title
+    // artwork once the bundle is in) must not leak through.
     batch.fill(
         atlas,
         0.0,
@@ -580,246 +1622,21 @@ pub fn draw_boot(
         batch.height,
         color::hex(0x000000, 255),
     );
-    wordmark(atlas, batch, elapsed);
-    boot_progress(atlas, batch, stage, fraction, elapsed);
-    draw_boot_log(atlas, batch, logs);
-}
-
-/// The boot screen's centred column — wordmark, sub-line, bar and meta row —
-/// laid out once so every piece hangs off the same edges. The GDI boot
-/// paint (`horizon_threads::boot_paint`) mirrors these formulas by hand.
-struct BootLayout {
-    size: f32,
-    small: f32,
-    top: f32,
-    left: f32,
-    right: f32,
-    sub_y: f32,
-    bar_y: f32,
-    meta_y: f32,
-}
-
-fn boot_layout(ui: &Ui) -> BootLayout {
-    let size = (ui.w / 16.0).clamp(DISPLAY, 96.0);
-    let small = (size * 0.25).clamp(MICRO, 18.0);
-    let mark = ui.measure(Face::SemiBold, size, "ONYX");
-    let total =
-        size * 1.45 + small * 0.6 + small * 1.5 + size * 0.55 + BOOT_BAR + 9.0 + MICRO * 1.5;
-    let top = (ui.h - total) / 2.0;
-    let sub_y = top + size * 1.45 + small * 0.6;
-    let bar_y = sub_y + small * 1.5 + size * 0.55;
-    BootLayout {
-        size,
-        small,
-        top,
-        left: ui.w / 2.0 - mark / 2.0,
-        right: ui.w / 2.0 + mark / 2.0,
-        sub_y,
-        bar_y,
-        meta_y: bar_y + BOOT_BAR + 9.0,
-    }
-}
-
-/// The wordmark, centred: ONYX in the design system's SemiBold over a
-/// letterspaced mono sub-line that ends at the wordmark's right edge.
-fn wordmark(atlas: &HudAtlas, batch: &mut HudBatch, elapsed: Duration) {
-    let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
-    let l = boot_layout(&ui);
-    // ONYX fork: the glow is the wordmark drawn again at small offsets in
-    // translucent ice blue, pulsing gently with the elapsed time — the
-    // closest the HUD's flat text comes to a blurred halo.
-    let pulse = 0.5 + 0.5 * (elapsed.as_secs_f32() * 2.2).sin();
-    let glow = color::with_alpha(BOOT_GLOW, 0.10 + 0.14 * pulse);
-    let d = (l.size * 0.022).max(1.5);
-    for (dx, dy) in [(-d, 0.0), (d, 0.0), (0.0, d)] {
-        ui.text(
-            Face::SemiBold,
-            l.size,
-            l.left + dx,
-            l.top + dy,
-            glow,
-            "ONYX",
-        );
-    }
-    ui.text(Face::SemiBold, l.size, l.left, l.top, BOOT_TEXT, "ONYX");
-    text_tracked_right(
-        &mut ui,
-        Face::Mono,
-        l.small,
-        l.right,
-        l.sub_y,
-        l.small * 0.16,
-        l.right - l.left,
-        BOOT_SUB,
-        "HORIZON CLIENT",
-    );
-    ui.finish();
-}
-
-/// `text` with `tracking` dp of extra advance between the glyphs, ending at
-/// `right`: the sub-line's letterspacing, which `Ui::text` has no knob for.
-/// The tracking shrinks rather than let the line outgrow `max_w`.
-fn text_tracked_right(
-    ui: &mut Ui,
-    face: Face,
-    size: f32,
-    right: f32,
-    y: f32,
-    tracking: f32,
-    max_w: f32,
-    color: u32,
-    text: &str,
-) {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
+    let phase = boot_phase(finish.map(|f| f.as_secs_f32()));
+    if phase.done {
         return;
     }
-    let widths: Vec<f32> = chars
-        .iter()
-        .map(|c| ui.measure(face, size, &c.to_string()))
-        .collect();
-    let plain: f32 = widths.iter().sum();
-    let gaps = (chars.len() - 1) as f32;
-    let tracking = if gaps > 0.0 {
-        tracking.min(((max_w - plain) / gaps).max(0.0))
-    } else {
-        0.0
-    };
-    let mut x = right - (plain + tracking * gaps);
-    for (c, w) in chars.iter().zip(&widths) {
-        let mut buf = [0u8; 4];
-        ui.text(face, size, x, y, color, c.encode_utf8(&mut buf));
-        x += w + tracking;
-    }
-}
-
-/// The loader's progress under the wordmark: the bar across the wordmark's
-/// width, and under it the meta row — the stage on the left, the percentage
-/// on the right.
-fn boot_progress(
-    atlas: &HudAtlas,
-    batch: &mut HudBatch,
-    stage: &str,
-    fraction: f32,
-    elapsed: Duration,
-) {
+    let et = elapsed.as_secs_f32();
     let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
-    let l = boot_layout(&ui);
-    let fraction = fraction.clamp(0.0, 1.0);
-    let w = l.right - l.left;
-    let fill_w = (w - 2.0).max(0.0) * fraction;
-    if fill_w > 0.0 {
-        // The fill's soft leading edge, a translucent ice plate just past it.
-        let pulse = 0.5 + 0.5 * (elapsed.as_secs_f32() * 2.2).sin();
-        let glow = color::with_alpha(BOOT_GLOW, 0.14 + 0.10 * pulse);
-        ui.rounded(
-            l.left - 0.5,
-            l.bar_y - 1.5,
-            fill_w + 3.0,
-            BOOT_BAR + 3.0,
-            4.0,
-            glow,
-        );
-    }
-    ui.rounded(l.left, l.bar_y, w, BOOT_BAR, 3.0, BOOT_TRACK);
-    if fill_w > 0.0 {
-        ui.rounded(
-            l.left + 1.0,
-            l.bar_y + 1.0,
-            fill_w,
-            BOOT_BAR - 2.0,
-            2.0,
-            BOOT_ICE,
-        );
-        // The fill runs to white at its leading edge.
-        let seg = fill_w.min(16.0);
-        ui.rounded(
-            l.left + 1.0 + fill_w - seg,
-            l.bar_y + 1.0,
-            seg,
-            BOOT_BAR - 2.0,
-            2.0,
-            BOOT_TEXT,
-        );
-    }
-    ui.border(l.left, l.bar_y, w, BOOT_BAR, 3.0, BOOT_BORDER);
-    ui.text(
-        Face::Mono,
-        MICRO,
-        l.left,
-        l.meta_y,
-        BOOT_DIM,
-        &stage.to_uppercase(),
-    );
-    let pct = format!("{:.0}%", fraction * 100.0);
-    let pct_w = ui.measure(Face::Mono, MICRO, &pct);
-    ui.text(Face::Mono, MICRO, l.right - pct_w, l.meta_y, BOOT_DIM, &pct);
+    let mark = boot_mark(&ui);
+    boot_halo(&mut ui, et, &phase);
+    boot_stars(&mut ui, et, &phase);
+    boot_diamond(&mut ui, et, &phase, &mark);
+    boot_wordmark(&mut ui, et, &phase, &mark);
+    boot_seam(&mut ui, et, &phase, &mark);
+    boot_tag(&mut ui, et, &phase, &mark);
+    boot_bar(&mut ui, fraction, et, &phase);
     ui.finish();
-}
-
-/// The console's last lines at the bottom left, over any loading screen: long
-/// lines wrap word-wise, the block grows upwards.
-pub fn draw_boot_log(atlas: &HudAtlas, batch: &mut HudBatch, logs: &[String]) {
-    if logs.is_empty() {
-        return;
-    }
-    let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
-    let (size, line, pad) = (MICRO, MICRO * 1.5, 16.0);
-    let max_w = ui.w / 2.0;
-    let max_rows = (((ui.h - pad) / line) as usize).clamp(1, 24);
-    let mut y = ui.h - pad - line;
-    let mut drawn = 0;
-    'lines: for text in logs.iter().rev() {
-        let chunks = wrapping_lines(&ui, Face::Mono, size, text, max_w);
-        for chunk in chunks.iter().rev() {
-            if drawn == max_rows {
-                break 'lines;
-            }
-            ui.text(Face::Mono, size, pad, y, BOOT_LOG, chunk);
-            y -= line;
-            drawn += 1;
-        }
-    }
-    ui.finish();
-}
-
-/// The lines `text` wraps into at `max_w`, word-wise; a word wider than
-/// `max_w` on its own breaks at the edge.
-fn wrapping_lines(ui: &Ui, face: Face, size: f32, text: &str, max_w: f32) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split(' ') {
-        let mut word = word;
-        loop {
-            let candidate = if line.is_empty() {
-                word.to_owned()
-            } else {
-                format!("{line} {word}")
-            };
-            if ui.measure(face, size, &candidate) <= max_w {
-                line = candidate;
-                break;
-            }
-            if line.is_empty() {
-                // The word alone does not fit: hard-break it at the edge.
-                let mut end = 0;
-                for (i, ch) in word.char_indices() {
-                    if i > 0 && ui.measure(face, size, &word[..i]) > max_w {
-                        break;
-                    }
-                    end = i + ch.len_utf8();
-                }
-                lines.push(word[..end].to_owned());
-                word = &word[end..];
-            } else {
-                lines.push(std::mem::take(&mut line));
-            }
-        }
-    }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
 }
 
 #[cfg(test)]
@@ -869,11 +1686,11 @@ mod tests {
     }
 
     #[test]
-    fn the_boot_screen_centres_the_wordmark_and_left_aligns_the_console() {
+    fn the_boot_screen_draws_the_design_on_pure_black() {
         reset_atlas();
         let atlas = HudAtlas::boot();
         let mut batch = HudBatch::new([1280, 720]);
-        draw_boot(&atlas, &mut batch, &[], "Loading menu", 0.0, Duration::ZERO);
+        draw_boot(&atlas, &mut batch, 0.5, Duration::from_secs(2), None);
         // The first quad is the pure black backdrop over the frame's panorama.
         let (w, h) = (batch.width, batch.height);
         let bg = &batch.vertices[..6];
@@ -884,62 +1701,86 @@ mod tests {
             !batch.patches.is_empty(),
             "the glyphs are queued for the atlas"
         );
-
-        let mut batch = HudBatch::new([1280, 720]);
-        wordmark(&atlas, &mut batch, Duration::ZERO);
+        // The wordmark straddles the centre.
         let (min, max) = batch
             .vertices
             .iter()
             .map(|v| v.pos[0])
             .fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(x), b.max(x)));
         assert!(
-            min < batch.width / 2.0 && max > batch.width / 2.0,
-            "the wordmark straddles the centre"
+            min < w / 2.0 && max > w / 2.0,
+            "the design spans the centre"
         );
-        assert!(((min + max) / 2.0 - batch.width / 2.0).abs() < 1.0);
-
-        let long = "[12:34:56] [Render thread/INFO]: Horizon: resources loaded in 1.0s; 1240 block states, 1500 items, 62 biomes; 8 worker threads".to_owned();
-        let mut batch = HudBatch::new([1280, 720]);
-        draw_boot_log(&atlas, &mut batch, &[long]);
-        let (min, max) = batch
+        // Where the old console block lived (the bottom rows) there is
+        // now only the odd star: a handful of small quads, never the
+        // console's rows of glyph quads running up from the bottom edge.
+        let bottom = batch
             .vertices
             .iter()
+            .filter(|v| v.pos[1] > h * 0.97)
+            .count();
+        assert!(
+            bottom < 300,
+            "no console text at the bottom: {bottom} vertices"
+        );
+        // At full fraction the bar's fill reaches toward the right margin.
+        let mut batch = HudBatch::new([1280, 720]);
+        draw_boot(&atlas, &mut batch, 1.0, Duration::from_secs(2), None);
+        let bar_max_x = batch
+            .vertices
+            .iter()
+            .filter(|v| v.pos[1] > h * 0.85)
             .map(|v| v.pos[0])
-            .fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(x), b.max(x)));
-        assert!(min >= 4.0, "the line stays inside the left inset");
+            .fold(f32::MIN, f32::max);
         assert!(
-            max - min <= batch.width / 2.0 + 1.0,
-            "a too wide line is cut to half the screen"
+            bar_max_x > w * 0.9,
+            "the full bar reaches the right margin: {bar_max_x} of {w}"
         );
-
-        let mut batch = HudBatch::new([1280, 720]);
-        let ui = Ui::new(&atlas, &mut batch, (0.0, 0.0));
-        let lines = wrapping_lines(
-            &ui,
-            Face::Mono,
-            MICRO,
-            "the quick brown fox jumps over the lazy dog",
-            90.0,
-        );
-        assert!(lines.len() > 1, "a long line wraps");
-        assert!(
-            lines
-                .iter()
-                .all(|l| ui.measure(Face::Mono, MICRO, l) <= 90.0),
-            "every wrapped line fits"
-        );
-        assert_eq!(
-            lines
-                .iter()
-                .map(|l| l.split_whitespace().count())
-                .sum::<usize>(),
-            9,
-            "the wrap keeps every word"
-        );
-
-        let mut batch = HudBatch::new([1280, 720]);
-        draw_boot_log(&atlas, &mut batch, &[]);
-        assert!(batch.vertices.is_empty() && batch.patches.is_empty());
         reset_atlas();
+    }
+
+    #[test]
+    fn the_finish_sequence_keeps_its_order() {
+        // Loading: the neutral phase.
+        let p = boot_phase(None);
+        assert_eq!(p.bar_alpha, 1.0);
+        assert_eq!(p.logo_scale, 1.0);
+        assert!(p.ghosts.iter().all(|g| g.0 == 0.0));
+        // The bar holds and flashes first.
+        let p = boot_phase(Some(0.15));
+        assert_eq!(p.bar_alpha, 1.0);
+        assert!((p.bar_flash - 1.0).abs() < 1e-6);
+        // It is fully gone before the bounce begins, and stays gone.
+        for t in [BOOT_BAR_END, 0.85, 0.90, BOOT_BOUNCE_AT - 0.01] {
+            let p = boot_phase(Some(t));
+            assert_eq!(p.bar_alpha, 0.0, "bar gone at {t}");
+            assert_eq!(p.logo_scale, 1.0, "no bounce yet at {t}");
+            assert!(p.ghosts.iter().all(|g| g.0 == 0.0), "no ghosts at {t}");
+        }
+        // The bounce overshoots on the design's keyframe (28% of 1.15s).
+        let p = boot_phase(Some(BOOT_BOUNCE_AT + 0.28 * BOOT_BOUNCE_LEN));
+        assert!(
+            (p.logo_scale - 1.065).abs() < 0.01,
+            "logo overshoot: {}",
+            p.logo_scale
+        );
+        assert!(p.gem_scale > 1.0 && p.gem_scale < p.logo_scale);
+        // Ghosts exist only inside the bounce window.
+        let p = boot_phase(Some(BOOT_BOUNCE_AT + 0.25));
+        assert!(p.ghosts[0].0 > 0.0 && p.ghosts[0].1 > 1.0);
+        let p = boot_phase(Some(3.0));
+        assert!(
+            p.ghosts.iter().all(|g| g.0 == 0.0),
+            "ghosts spent by the fade"
+        );
+        // The fade runs after the bounce, the stars last, and the
+        // sequence ends on black within its total length.
+        assert_eq!(boot_phase(Some(2.0)).fade, 1.0);
+        let p = boot_phase(Some(3.0));
+        assert!(p.fade < 0.2 && p.star_fade > p.fade, "stars fade last");
+        let p = boot_phase(Some(BOOT_SEQ_TOTAL.as_secs_f32()));
+        assert!(p.done);
+        assert_eq!(p.star_fade, 0.0);
+        assert_eq!(p.fade, 0.0);
     }
 }

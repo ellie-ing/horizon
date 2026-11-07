@@ -57,10 +57,21 @@ pub fn startup_root(
     selected: &[String],
     server: &[Pack],
 ) -> std::io::Result<PathBuf> {
+    startup_root_with_progress(vanilla, selected, server, None)
+}
+
+/// ONYX fork: [`startup_root`], with the overlay build's mirror jobs
+/// reporting into `progress` for the boot screen's bar.
+pub fn startup_root_with_progress(
+    vanilla: &Path,
+    selected: &[String],
+    server: &[Pack],
+    progress: Option<&packs::ProgressSink>,
+) -> std::io::Result<PathBuf> {
     let all = packs::discover(vanilla, &packs_dir());
     let mut enabled = packs::enabled(&all, selected);
     enabled.extend_from_slice(server);
-    packs::resource_root(vanilla, &enabled, &cache_dir())
+    packs::resource_root_with_progress(vanilla, &enabled, &cache_dir(), progress)
 }
 fn info(p: &Pack) -> PackInfo {
     let built_in = !p.id.starts_with("file/");

@@ -2159,6 +2159,16 @@ impl UiResources {
     /// From a resource root layering packs over `defaults`, the game's own
     /// resources (`root` itself when no pack is on).
     pub fn load(root: &std::path::Path, defaults: &std::path::Path) -> Result<Self> {
+        Self::load_with_progress(root, defaults, None)
+    }
+    /// ONYX fork: [`load`](Self::load), advancing the boot fraction at
+    /// its two real milestones: the atlas is built (0.45) and the whole
+    /// bundle, panorama included, is complete (0.55).
+    fn load_with_progress(
+        root: &std::path::Path,
+        defaults: &std::path::Path,
+        progress: Option<&Progress>,
+    ) -> Result<Self> {
         // The title screen waits for both: the panorama's six faces decode
         // beside the atlas.
         std::thread::scope(|scope| {
@@ -2171,13 +2181,20 @@ impl UiResources {
             let atlas = startup::time("ui.atlas", || {
                 HudAtlas::build_over_with_image(root, defaults, mod_image)
             });
+            if let Some(progress) = progress {
+                progress.advance_to(0.45);
+            }
             let panorama = panorama
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            Ok(Self {
+            let this = Self {
                 atlas: atlas?,
                 panorama: Arc::new(panorama),
-            })
+            };
+            if let Some(progress) = progress {
+                progress.advance_to(0.55);
+            }
+            Ok(this)
         })
     }
     /// What a server's game holds, since it draws nothing: the font, which books
@@ -20394,6 +20411,13 @@ const STAGE_LINES: [&str; 10] = [
 #[derive(Clone)]
 struct Progress {
     value: Arc<AtomicU32>,
+    /// ONYX fork: a fine-grained fraction (f32 bits), fed by the loader's
+    /// measurable sub-steps (pack mirror jobs, UI bundle milestones) and
+    /// advanced monotonically, so the boot screen's bar can move for the
+    /// whole visible boot instead of jumping between stage checkpoints.
+    /// Non-negative f32 bit patterns order like the floats, so a
+    /// `fetch_max` on the bits is a monotonic advance.
+    fine: Arc<AtomicU32>,
     lines: &'static [&'static str],
 }
 impl Progress {
@@ -20403,14 +20427,27 @@ impl Progress {
     fn with(lines: &'static [&'static str]) -> Self {
         Self {
             value: Arc::new(AtomicU32::new(0)),
+            fine: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             lines,
         }
     }
     fn set(&self, stage: u32) {
         self.value.store(stage, Ordering::Relaxed);
     }
+    /// ONYX fork: advance the fine fraction to at least `fraction`
+    /// (clamped to 0..=1); never moves backwards, even across a pack
+    /// reload's stage rollback.
+    fn advance_to(&self, fraction: f32) {
+        let bits = fraction.clamp(0.0, 1.0).to_bits();
+        self.fine.fetch_max(bits, Ordering::Relaxed);
+    }
+    fn fine_fraction(&self) -> f32 {
+        f32::from_bits(self.fine.load(Ordering::Relaxed))
+    }
     fn fraction(&self) -> f32 {
-        self.value.load(Ordering::Relaxed) as f32 / (self.lines.len() - 1) as f32
+        let stage = self.value.load(Ordering::Relaxed) as f32 / (self.lines.len() - 1) as f32;
+        // ONYX fork: whichever view of the load is further along wins.
+        stage.max(self.fine_fraction())
     }
     fn line(&self) -> &'static str {
         self.lines[(self.value.load(Ordering::Relaxed) as usize).min(self.lines.len() - 1)]
@@ -20552,6 +20589,8 @@ fn load_core(
         Err(e) => return Ok(Err(e.to_string())),
     };
     progress.set(1);
+    // ONYX fork: core band of the boot fraction (see `Progress::fine`).
+    progress.advance_to(0.62);
     let registry = assets.registry;
     let (render, gameplay, visibility, biomes, environment, collision) =
         std::thread::scope(|scope| {
@@ -20634,6 +20673,7 @@ fn load_core(
     };
     let gameplay = gameplay?;
     progress.set(3);
+    progress.advance_to(0.90);
     Ok(Ok(CoreTables {
         item_defaults,
         gameplay,
@@ -20675,6 +20715,7 @@ fn gameplay_tables(
     );
     drop(facts_step);
     progress.set(2);
+    progress.advance_to(0.74);
     let (light, motion) = std::thread::scope(|scope| {
         let light = Step::spawn(scope, parallel, "light", || {
             startup::time("core.light", || {
@@ -20724,12 +20765,19 @@ fn load_resources(
     let mut pack_error = None;
     // A dedicated server builds only the font (UiResources::server), as the
     // integrated server's game does: the full atlas and panorama are 144 MB.
+    // ONYX fork: resource loading has begun — the boot fraction's pack
+    // band is behind us and the core/UI bands take over from here.
+    progress.advance_to(0.30);
     let load_ui = |root: &std::path::Path| {
         let _step = startup::step("ui.load");
         if headless {
-            UiResources::server(root)
+            let ui = UiResources::server(root);
+            if ui.is_ok() {
+                progress.advance_to(0.55);
+            }
+            ui
         } else {
-            UiResources::load(root, vanilla_root)
+            UiResources::load_with_progress(root, vanilla_root, Some(progress))
         }
     };
     // The menu bundle loads on this thread while workers build the world
@@ -20823,6 +20871,7 @@ fn load_resources(
     drop(pack_step);
     log::info!("load pack tables: {:.2}s", started.elapsed().as_secs_f32());
     progress.set(4);
+    progress.advance_to(0.95);
     if !menu {
         horizon_client::ui::load_metadata(&root);
         horizon_client::lang::set(horizon_client::lang::Language::load(
@@ -20831,6 +20880,7 @@ fn load_resources(
         ));
     }
     progress.set(5);
+    progress.advance_to(0.97);
     let suffocation =
         horizon_client::mobs::suffocation::bind(collision.clone(), &motion.causes_suffocation)?;
     let resources = Resources {
@@ -21640,6 +21690,10 @@ struct Loading {
     /// the easing runs on frame time.
     boot_shown: f32,
     boot_frame_at: Option<Instant>,
+    /// ONYX fork: when the finish sequence began (loader done, handoff
+    /// ready): while it runs the boot screen keeps drawing over the menu
+    /// bundle and `finish` is withheld until it completes.
+    finishing: Option<Instant>,
     /// When the menu bundle arrived (`set_ui`), and whether a title frame with
     /// it was presented since: the world renderer waits for that frame
     /// (`ready_for_handoff`).
@@ -21659,6 +21713,21 @@ impl Loading {
         self.title_drawn
             || self.menu.pending.is_some()
             || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT)
+    }
+    /// ONYX fork: the boot screen's finish sequence gate. The first call
+    /// (loader done, handoff ready) starts the sequence — the bar is set
+    /// to a full 1.0, the only place 1.0 is ever set — and returns false;
+    /// later calls return true once the sequence has played out, so the
+    /// handoff proceeds exactly as it did without the sequence.
+    fn boot_finish_ready(&mut self) -> bool {
+        match self.finishing {
+            None => {
+                self.finishing = Some(Instant::now());
+                self.progress.advance_to(1.0);
+                false
+            }
+            Some(at) => at.elapsed() >= crate::ui_theme::BOOT_SEQ_TOTAL,
+        }
     }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -21700,16 +21769,16 @@ impl Loading {
         horizon_client::telemetry::note_display(&window);
         // The renderer takes seconds to build and winit's window sits white
         // until the first frame presents, so paint the boot screen on it and
-        // keep repainting it as the console's lines arrive; the wgpu frames
-        // redraw the same design when they start. GDI is unsafe:
+        // keep repainting it while the loader runs; the wgpu frames redraw
+        // the same design when they start. GDI is unsafe:
         // horizon-threads holds it (this crate forbids unsafe code).
         #[cfg(target_os = "windows")]
         let boot_paint_stop = hwnd(&window).map(|hwnd| {
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let repaint_stop = stop.clone();
             // ONYX fork: the painted boot screen shows the loader's progress
-            // too: the stage fraction, eased at the repaint cadence so the
-            // painted bar glides like the wgpu one and never passes the real
+            // too: the fraction, eased at the repaint cadence so the painted
+            // bar glides like the wgpu one and never passes the real
             // fraction.
             let progress = self.progress.clone();
             let started = self.started;
@@ -21725,9 +21794,7 @@ impl Loading {
                         hwnd,
                         horizon_theme::fonts::GEIST_SEMIBOLD,
                         horizon_theme::fonts::GEIST_MONO,
-                        &horizon_client::logging::recent_lines(),
                         shown,
-                        progress.line(),
                         started.elapsed(),
                     );
                     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -22009,7 +22076,16 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                match if loading.menu.reload_packs || !loading.ready_for_handoff() {
+                // ONYX fork: once the loader's `Done` has arrived and the
+                // handoff is ready, the boot screen first plays its finish
+                // sequence (`Loading::boot_finish_ready`); only then is
+                // `loaded` taken, exactly as before. A loader error skips
+                // the sequence and surfaces as it always did.
+                match if loading.menu.reload_packs
+                    || !loading.ready_for_handoff()
+                    || (loading.loaded.as_ref().is_some_and(|loaded| loaded.is_ok())
+                        && !loading.boot_finish_ready())
+                {
                     None
                 } else {
                     loading.loaded.take()
@@ -22114,6 +22190,7 @@ fn run_loading(
         shown: false,
         boot_shown: 0.0,
         boot_frame_at: None,
+        finishing: None,
         ui_at: None,
         title_drawn: false,
         menu,

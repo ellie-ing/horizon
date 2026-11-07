@@ -360,12 +360,26 @@ pub(super) fn spawn_loader(
         .name("resource-loader".into())
         .spawn(move || {
             let mut pack_error = None;
-            let root = packs::startup_root(&vanilla_root, &settings.resource_packs, &[])
-                .unwrap_or_else(|error| {
-                    pack_error = Some(error.to_string());
-                    vanilla_root.clone()
+            // ONYX fork: the pack overlay build's mirror jobs feed the
+            // boot fraction's first band (0..0.27); the band's end is
+            // marked when both roots are resolved, cache hit or not.
+            let pack_progress = progress.clone();
+            let sink: horizon_client::packs::ProgressSink =
+                std::sync::Arc::new(move |local: f32| {
+                    pack_progress.advance_to(0.27 * local.clamp(0.0, 1.0));
                 });
+            let root = packs::startup_root_with_progress(
+                &vanilla_root,
+                &settings.resource_packs,
+                &[],
+                Some(&sink),
+            )
+            .unwrap_or_else(|error| {
+                pack_error = Some(error.to_string());
+                vanilla_root.clone()
+            });
             let root = mods::content_root(&root, &settings.mods.enabled, &dev_mods);
+            progress.advance_to(0.29);
             let result = load_resources(
                 root,
                 world.as_deref(),
@@ -967,6 +981,38 @@ impl Loading {
         {
             return Ok(());
         }
+        // ONYX fork: while the boot screen is what's on the window — the
+        // menu bundle has not arrived, or the finish sequence is playing —
+        // the screens underneath must not take input: their buttons are
+        // invisible, so clicks and keys would act on things the player
+        // cannot see. Window-level events fall through to the match below,
+        // as do the two keys the boot screen itself honours: F11 and the
+        // queued entry's Escape.
+        if self.gui.is_none() || self.finishing.is_some() {
+            match &event {
+                WindowEvent::CloseRequested
+                | WindowEvent::Resized(_)
+                | WindowEvent::RedrawRequested
+                | WindowEvent::ModifiersChanged(_)
+                | WindowEvent::Focused(_) => {}
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed =>
+                {
+                    if event.physical_key == PhysicalKey::Code(KeyCode::F11) {
+                        self.settings.fullscreen = !self.settings.fullscreen;
+                        self.apply_menu_settings();
+                        self.save_menu_settings();
+                    } else if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
+                        && self.menu.pending.is_some()
+                    {
+                        self.menu.pending = None;
+                        self.menu.perf.cancel_world_opening();
+                    }
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
         match event {
             WindowEvent::CloseRequested => {
                 if !self.settings.quit_shortcuts
@@ -1165,13 +1211,25 @@ impl Loading {
     }
 
     pub(super) fn draw_menu(&mut self, batch: &mut HudBatch) {
-        let logs = horizon_client::logging::recent_lines();
+        // ONYX fork: while the finish sequence plays (loader done, handoff
+        // pending) the boot screen holds the window again, drawn into the
+        // menu bundle's atlas — the one the loading renderer samples once
+        // the bundle exists.
+        if let (Some(at), Some(gui)) = (self.finishing, &self.gui) {
+            horizon_client::ui_theme::draw_boot(
+                &gui.atlas,
+                batch,
+                1.0,
+                self.started.elapsed(),
+                Some(at.elapsed()),
+            );
+            return;
+        }
         let Some(gui) = &self.gui else {
-            // The pack's screens do not exist yet: the boot screen holds the
-            // window, the wordmark and the console's lines while they load.
-            // ONYX fork: the boot bar eases toward the loader's stage
-            // fraction instead of jumping stage to stage; it never passes
-            // the real fraction.
+            // The pack's screens do not exist yet: the boot screen holds
+            // the window while they load. Its bar eases toward the loader's
+            // fraction instead of jumping checkpoint to checkpoint; it
+            // never passes the real fraction.
             let now = Instant::now();
             let dt = self
                 .boot_frame_at
@@ -1186,10 +1244,9 @@ impl Loading {
             horizon_client::ui_theme::draw_boot(
                 &self.boot,
                 batch,
-                &logs,
-                self.progress.line(),
                 self.boot_shown,
                 self.started.elapsed(),
+                None,
             );
             return;
         };
@@ -1284,6 +1341,11 @@ impl Loading {
             })?;
         }
         self.progress = Progress::new();
+        // ONYX fork: a fresh generation starts the boot screen over too —
+        // no leftover finish sequence or eased bar from the old one.
+        self.finishing = None;
+        self.boot_shown = 0.0;
+        self.boot_frame_at = None;
         let options = self.options.as_ref().ok_or("loading already finished")?;
         let (receiver, handle) = spawn_loader(
             options,
@@ -1334,6 +1396,7 @@ mod tests {
             shown: false,
             boot_shown: 0.0,
             boot_frame_at: None,
+            finishing: None,
             ui_at: None,
             title_drawn: false,
             menu: StartupMenu::default(),
@@ -1356,6 +1419,34 @@ mod tests {
         loading.title_drawn = false;
         loading.ui_at = Instant::now().checked_sub(Duration::from_secs(2));
         assert!(loading.ready_for_handoff());
+    }
+
+    #[test]
+    fn boot_progress_fine_fraction_is_monotonic_and_banded() {
+        let progress = Progress::new();
+        // The pack band: a local build fraction maps into 0..0.27.
+        progress.advance_to(0.27 * 0.5);
+        assert!((progress.fraction() - 0.135).abs() < 1e-6);
+        // Stage checkpoints still drive the line and can only raise the
+        // fraction (stage 1 of 9 is behind the fine value here).
+        progress.set(1);
+        assert_eq!(progress.line(), STAGE_LINES[1]);
+        assert!((progress.fraction() - 0.135).abs() < 1e-6);
+        // Later bands advance; a stale or repeated report never regresses.
+        progress.advance_to(0.62);
+        progress.advance_to(0.30);
+        progress.advance_to(0.62);
+        assert!((progress.fraction() - 0.62).abs() < 1e-6);
+        // A stage rollback (the pack-failure path re-runs the core) cannot
+        // pull the bar back either.
+        progress.set(0);
+        assert!((progress.fraction() - 0.62).abs() < 1e-6);
+        // Only the finish trigger's 1.0 completes it.
+        progress.advance_to(1.0);
+        assert_eq!(progress.fraction(), 1.0);
+        // Out-of-range reports clamp.
+        progress.advance_to(2.0);
+        assert_eq!(progress.fraction(), 1.0);
     }
 
     #[test]
