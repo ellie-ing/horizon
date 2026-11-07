@@ -16,9 +16,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     AddFontMemResourceEx, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap,
     CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DT_CALCRECT,
     DT_CENTER, DT_NOCLIP, DT_SINGLELINE, DT_VCENTER, DeleteDC, DeleteObject, DrawTextW,
-    FF_DONTCARE, FillRect, GetDC, IntersectClipRect, LineTo, MoveToEx, PS_SOLID, ReleaseDC,
-    RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor,
-    TRANSPARENT,
+    FF_DONTCARE, FillRect, GetDC, IntersectClipRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS,
+    PS_SOLID, ReleaseDC, RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode,
+    SetTextCharacterExtra, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
 
