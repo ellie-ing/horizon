@@ -21690,10 +21690,15 @@ struct Loading {
     /// the easing runs on frame time.
     boot_shown: f32,
     boot_frame_at: Option<Instant>,
-    /// ONYX fork: when the finish sequence began (loader done, handoff
-    /// ready): while it runs the boot screen keeps drawing over the menu
-    /// bundle and `finish` is withheld until it completes.
+    /// ONYX fork: when the finish sequence began (the loader reached
+    /// its last checkpoints): while it runs the boot screen draws over
+    /// the menu bundle and `finish` is withheld until it completes AND
+    /// the loader's `Done` has arrived.
     finishing: Option<Instant>,
+    /// ONYX fork: how long this generation's finish sequence runs, set
+    /// when it starts from the load's elapsed time (`boot_seq_duration`:
+    /// a quick boot finishes quick, never slower than the design).
+    finishing_len: Duration,
     /// When the menu bundle arrived (`set_ui`), and whether a title frame with
     /// it was presented since: the world renderer waits for that frame
     /// (`ready_for_handoff`).
@@ -21705,6 +21710,10 @@ struct Loading {
 /// How long the handoff waits for the first title frame before building the
 /// world renderer anyway (a hidden window may never be asked to redraw).
 const TITLE_FRAME_WAIT: Duration = Duration::from_secs(1);
+/// ONYX fork: the fine fraction at which the loader is on its last
+/// checkpoints (pack assembly done, only the tail remains) and the
+/// boot screen's finish sequence starts, as part of loading itself.
+const BOOT_FINISH_AT: f32 = 0.95;
 impl Loading {
     /// The world renderer is built on the main thread, so building it before
     /// the title is on the screen holds the title back by that build. Wait for
@@ -21714,19 +21723,57 @@ impl Loading {
             || self.menu.pending.is_some()
             || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT)
     }
-    /// ONYX fork: the boot screen's finish sequence gate. The first call
-    /// (loader done, handoff ready) starts the sequence — the bar is set
-    /// to a full 1.0, the only place 1.0 is ever set — and returns false;
-    /// later calls return true once the sequence has played out, so the
-    /// handoff proceeds exactly as it did without the sequence.
-    fn boot_finish_ready(&mut self) -> bool {
+    /// ONYX fork: the boot screen's finish sequence is the tail of the
+    /// loading process itself, not an extra act after it: it starts
+    /// when the loader reaches its last checkpoints (the fine fraction
+    /// hits the 0.95 band, at pack assembly), while the loader's final
+    /// work — the rest of stage 5 and the handoff CPU prep — runs on
+    /// underneath it. Starting sets the bar to a full 1.0, the only
+    /// place 1.0 is ever set, and picks the sequence's length from how
+    /// long this load took to get here (`boot_seq_duration`).
+    ///
+    /// A queued world entry suppresses the sequence (its own loading
+    /// overlay owns the window), and a loader error skips it entirely:
+    /// the error surfaces as it always did.
+    fn maybe_start_boot_finish(&mut self) {
+        // `Done` with a success also starts it, whatever the fraction:
+        // the bands guarantee 0.97 by then, but the handoff must never
+        // wait on a sequence that never started.
+        let last_checkpoints =
+            self.progress.fraction() >= BOOT_FINISH_AT || matches!(self.loaded, Some(Ok(_)));
+        if self.finishing.is_some()
+            || self.menu.pending.is_some()
+            || matches!(self.loaded, Some(Err(_)))
+            || !last_checkpoints
+        {
+            return;
+        }
+        self.finishing = Some(Instant::now());
+        self.finishing_len = crate::ui_theme::boot_seq_duration(self.started.elapsed());
+        self.progress.advance_to(1.0);
+    }
+    /// ONYX fork: whether the handoff still owes the finish sequence.
+    /// No sequence is owed when one never started because a world entry
+    /// is queued (suppressed) or the loader failed (skipped); once one
+    /// has started, the handoff waits for it to play out in full.
+    fn boot_finish_done(&self) -> bool {
         match self.finishing {
-            None => {
-                self.finishing = Some(Instant::now());
-                self.progress.advance_to(1.0);
-                false
-            }
-            Some(at) => at.elapsed() >= crate::ui_theme::BOOT_SEQ_TOTAL,
+            Some(at) => at.elapsed() >= self.finishing_len,
+            None => self.menu.pending.is_some() || !matches!(self.loaded, Some(Ok(_))),
+        }
+    }
+    /// ONYX fork: whether the boot screen is what's on the window: the
+    /// menu bundle has not arrived, or loading is still running under
+    /// it (the sequence not started, or started and not played out).
+    /// A queued world entry has its own overlay instead, and once the
+    /// sequence has played out the title is live even before `finish`.
+    fn boot_covering(&self) -> bool {
+        if self.gui.is_none() {
+            return true;
+        }
+        match self.finishing {
+            Some(at) => at.elapsed() < self.finishing_len,
+            None => self.menu.pending.is_none(),
         }
     }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -21898,6 +21945,10 @@ impl Loading {
             event_loop.exit();
             return;
         }
+        // ONYX fork: once the loader reaches its last checkpoints the
+        // finish sequence starts here, as the tail of this load; the
+        // handoff in `App::about_to_wait` waits for it and for `Done`.
+        self.maybe_start_boot_finish();
         self.poll_menu_realms(event_loop);
         if let Some(w) = &self.window {
             if self.options.as_ref().is_some_and(|o| o.offscreen) {
@@ -21917,7 +21968,10 @@ impl Loading {
             return;
         };
         let mut batch = HudBatch::new(size);
-        self.draw_menu(&mut batch);
+        // ONYX fork: `draw_menu` reports whether the title screen itself
+        // was in this batch — boot-covered frames and the queued entry's
+        // overlay don't count, the finishing fade's title underlay does.
+        let title_in_batch = self.draw_menu(&mut batch);
         self.menu.frame_drawn((batch.width, batch.height));
         let mut frame = loading_frame(&batch);
         frame.yaw = self.panorama_rotation.update(
@@ -21926,7 +21980,7 @@ impl Loading {
         );
         if let Some(renderer) = &mut self.renderer {
             match renderer.render(&frame) {
-                Ok(true) if self.gui.is_some() && self.menu.pending.is_none() => {
+                Ok(true) if title_in_batch => {
                     self.title_drawn = true;
                     self.menu.perf.title_shown()
                 }
@@ -22076,15 +22130,19 @@ impl ApplicationHandler for App {
                     event_loop.exit();
                     return;
                 }
-                // ONYX fork: once the loader's `Done` has arrived and the
-                // handoff is ready, the boot screen first plays its finish
-                // sequence (`Loading::boot_finish_ready`); only then is
-                // `loaded` taken, exactly as before. A loader error skips
-                // the sequence and surfaces as it always did.
+                // ONYX fork: `loaded` is taken only once BOTH halves of
+                // the boot's tail are done: the loader's `Done` has
+                // arrived (it is what's being taken) and the finish
+                // sequence — started at the loader's last checkpoints,
+                // not here — has played out (`Loading::boot_finish_done`).
+                // `ready_for_handoff` now gates only this final call: by
+                // now the fade's title underlay has presented real title
+                // frames. A loader error skips the sequence and surfaces
+                // as it always did.
                 match if loading.menu.reload_packs
                     || !loading.ready_for_handoff()
                     || (loading.loaded.as_ref().is_some_and(|loaded| loaded.is_ok())
-                        && !loading.boot_finish_ready())
+                        && !loading.boot_finish_done())
                 {
                     None
                 } else {
@@ -22191,6 +22249,7 @@ fn run_loading(
         boot_shown: 0.0,
         boot_frame_at: None,
         finishing: None,
+        finishing_len: crate::ui_theme::BOOT_SEQ_TOTAL,
         ui_at: None,
         title_drawn: false,
         menu,

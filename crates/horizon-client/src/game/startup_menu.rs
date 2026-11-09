@@ -982,13 +982,13 @@ impl Loading {
             return Ok(());
         }
         // ONYX fork: while the boot screen is what's on the window — the
-        // menu bundle has not arrived, or the finish sequence is playing —
-        // the screens underneath must not take input: their buttons are
-        // invisible, so clicks and keys would act on things the player
-        // cannot see. Window-level events fall through to the match below,
-        // as do the two keys the boot screen itself honours: F11 and the
-        // queued entry's Escape.
-        if self.gui.is_none() || self.finishing.is_some() {
+        // menu bundle has not arrived, loading is still running under
+        // it, or the finish sequence is playing — the screens underneath
+        // must not take input: their buttons are invisible, so clicks and
+        // keys would act on things the player cannot see. Window-level
+        // events fall through to the match below, as do the two keys the
+        // boot screen itself honours: F11 and the queued entry's Escape.
+        if self.boot_covering() {
             match &event {
                 WindowEvent::CloseRequested
                 | WindowEvent::Resized(_)
@@ -1210,45 +1210,102 @@ impl Loading {
         Ok(())
     }
 
-    pub(super) fn draw_menu(&mut self, batch: &mut HudBatch) {
-        // ONYX fork: while the finish sequence plays (loader done, handoff
-        // pending) the boot screen holds the window again, drawn into the
-        // menu bundle's atlas — the one the loading renderer samples once
-        // the bundle exists.
-        if let (Some(at), Some(gui)) = (self.finishing, &self.gui) {
-            horizon_client::ui_theme::draw_boot(
-                &gui.atlas,
-                batch,
-                1.0,
-                self.started.elapsed(),
-                Some(at.elapsed()),
-            );
-            return;
-        }
-        let Some(gui) = &self.gui else {
+    /// Draws the loading window's frame and reports whether the title
+    /// screen itself is in the batch.
+    ///
+    /// ONYX fork: the boot screen covers the whole loading phase, not
+    /// just the wait for the menu bundle — while loading runs (bundle or
+    /// not) the title is never the top layer, so it can neither flash
+    /// early nor be cut back from. Once the finish sequence starts, the
+    /// title is drawn *under* the boot layer: the sequence's fade thins
+    /// the boot screen's black field and dissolves into the live title,
+    /// and once the sequence has played out the title stands alone until
+    /// the handoff. A queued world entry keeps its own overlay on top
+    /// throughout, and the sequence stays suppressed while one is queued.
+    pub(super) fn draw_menu(&mut self, batch: &mut HudBatch) -> bool {
+        if self.gui.is_none() {
             // The pack's screens do not exist yet: the boot screen holds
-            // the window while they load. Its bar eases toward the loader's
-            // fraction instead of jumping checkpoint to checkpoint; it
-            // never passes the real fraction.
-            let now = Instant::now();
-            let dt = self
-                .boot_frame_at
-                .map_or(0.0, |at| now.duration_since(at).as_secs_f32());
-            self.boot_frame_at = Some(now);
-            let target = self.progress.fraction();
-            let step = 1.0 - (-dt * 3.5).exp();
-            self.boot_shown = (self.boot_shown + (target - self.boot_shown) * step).min(target);
-            if target - self.boot_shown < 0.001 {
-                self.boot_shown = target;
+            // the window while they load.
+            self.draw_boot_eased(batch, false);
+            return false;
+        }
+        if self.menu.pending.is_some() {
+            return self.draw_screens(batch);
+        }
+        match self.finishing {
+            // The sequence has played out: the title is live, alone,
+            // until `finish` takes over.
+            Some(at) if at.elapsed() >= self.finishing_len => self.draw_screens(batch),
+            // The sequence is playing: title first, then the boot layer
+            // over it in overlay mode, its black field riding the fade.
+            Some(at) => {
+                let title_drawn = self.draw_screens(batch);
+                let gui = self.gui.as_ref().expect("the bundle was checked above");
+                horizon_client::ui_theme::draw_boot(
+                    &gui.atlas,
+                    batch,
+                    1.0,
+                    self.started.elapsed(),
+                    Some(at.elapsed()),
+                    self.finishing_len,
+                    true,
+                );
+                title_drawn
             }
-            horizon_client::ui_theme::draw_boot(
-                &self.boot,
-                batch,
-                self.boot_shown,
-                self.started.elapsed(),
-                None,
-            );
-            return;
+            // Still loading, bundle in: the boot screen covers, drawn
+            // into the menu bundle's atlas — the one the loading
+            // renderer samples once the bundle exists.
+            None => {
+                self.draw_boot_eased(batch, true);
+                false
+            }
+        }
+    }
+
+    /// The boot screen on its own, its bar easing toward the loader's
+    /// fraction instead of jumping checkpoint to checkpoint; it never
+    /// passes the real fraction. Drawn with the boot atlas before the
+    /// bundle arrives (`gui_atlas` false), with the bundle's atlas after.
+    fn draw_boot_eased(&mut self, batch: &mut HudBatch, gui_atlas: bool) {
+        let now = Instant::now();
+        let dt = self
+            .boot_frame_at
+            .map_or(0.0, |at| now.duration_since(at).as_secs_f32());
+        self.boot_frame_at = Some(now);
+        let target = self.progress.fraction();
+        let step = 1.0 - (-dt * 3.5).exp();
+        self.boot_shown = (self.boot_shown + (target - self.boot_shown) * step).min(target);
+        if target - self.boot_shown < 0.001 {
+            self.boot_shown = target;
+        }
+        let atlas = if gui_atlas {
+            &self
+                .gui
+                .as_ref()
+                .expect("the bundle was checked above")
+                .atlas
+        } else {
+            &self.boot
+        };
+        horizon_client::ui_theme::draw_boot(
+            atlas,
+            batch,
+            self.boot_shown,
+            self.started.elapsed(),
+            None,
+            self.finishing_len,
+            false,
+        );
+    }
+
+    /// The menu's screens as the loader's window dressing: the queued
+    /// entry's loading overlay, the win screen, the options, or the
+    /// title. Returns whether the title screen itself was drawn, so the
+    /// caller can tell a real title frame from a boot-covered one.
+    fn draw_screens(&mut self, batch: &mut HudBatch) -> bool {
+        let mut title_drawn = false;
+        let Some(gui) = &self.gui else {
+            return false;
         };
         if self.menu.pending.is_some() {
             horizon_client::level_loading::draw_loading_overlay(
@@ -1273,6 +1330,7 @@ impl Loading {
                 .options
                 .draw(&self.settings, batch, &gui.atlas, self.menu.cursor);
         } else if let Some(title) = &mut self.menu.title {
+            title_drawn = true;
             title.poll_backup();
             if std::mem::take(&mut title.onboarding_finished) {
                 // Options.onboardingAccessibilityFinished.
@@ -1315,6 +1373,7 @@ impl Loading {
             batch,
             false,
         );
+        title_drawn
     }
 
     pub(super) fn restart_menu_resources(&mut self) -> Result<()> {
@@ -1344,6 +1403,7 @@ impl Loading {
         // ONYX fork: a fresh generation starts the boot screen over too —
         // no leftover finish sequence or eased bar from the old one.
         self.finishing = None;
+        self.finishing_len = horizon_client::ui_theme::BOOT_SEQ_TOTAL;
         self.boot_shown = 0.0;
         self.boot_frame_at = None;
         let options = self.options.as_ref().ok_or("loading already finished")?;
@@ -1397,6 +1457,7 @@ mod tests {
             boot_shown: 0.0,
             boot_frame_at: None,
             finishing: None,
+            finishing_len: horizon_client::ui_theme::BOOT_SEQ_TOTAL,
             ui_at: None,
             title_drawn: false,
             menu: StartupMenu::default(),
@@ -1450,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_is_usable_while_the_core_worker_is_blocked() {
+    fn boot_covers_the_menu_while_the_core_worker_is_blocked() {
         let root = std::env::temp_dir().join("horizon-startup-menu-no-world-resources");
         let (sender, receiver) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel();
@@ -1472,8 +1533,26 @@ mod tests {
         assert!(loading.gui.is_some());
         assert!(loading.loaded.is_none());
         assert!(!worker.is_finished());
-        // Navigate and enter a world name without a registry, biomes, pack
-        // tables or a Game. Replacing fallback artwork preserves this state.
+        // The bundle is in but the core is still loading: the boot
+        // screen covers the window — the title is neither drawn nor
+        // input-live — where the old flow presented a usable menu.
+        assert!(loading.boot_covering());
+        let mut batch = HudBatch::new([1280, 720]);
+        assert!(
+            !loading.draw_menu(&mut batch),
+            "no title frame while loading runs"
+        );
+        let (w, h) = (batch.width, batch.height);
+        let bg = &batch.vertices[..6];
+        assert!(
+            bg.iter().all(|v| v.color == 0xFF00_0000),
+            "the boot screen's black field is the frame's base"
+        );
+        assert!(bg.iter().all(|v| v.pos[0] == 0.0 || v.pos[0] == w));
+        assert!(bg.iter().all(|v| v.pos[1] == 0.0 || v.pos[1] == h));
+        // State-level navigation survives (it is how launch arguments
+        // and a pack reload reach the menu), and replacing fallback
+        // artwork preserves it.
         let title = loading.menu.title.as_mut().unwrap();
         title.mode = horizon_client::title::Mode::Create {
             name: String::new(),
@@ -1491,8 +1570,14 @@ mod tests {
             name: Some(name), seed: Some(42), creative: true, create: Some(_), ..
         }) if name == "My world")
         );
+        // A queued entry's own overlay owns the window, not the boot
+        // screen and not the title.
+        assert!(!loading.boot_covering());
         let mut batch = HudBatch::new([1280, 720]);
-        loading.draw_menu(&mut batch);
+        assert!(
+            !loading.draw_menu(&mut batch),
+            "the overlay is not a title frame"
+        );
         assert!(
             !batch.vertices.is_empty(),
             "queued entry draws loading progress"
@@ -1501,6 +1586,123 @@ mod tests {
         worker.join().unwrap();
         loading.poll_menu_resources().unwrap();
         assert!(matches!(loading.loaded, Some(Err(ref error)) if error == "core failure"));
+    }
+
+    #[test]
+    fn the_finish_sequence_starts_at_the_last_checkpoints() {
+        let (_send, receiver) = std::sync::mpsc::channel();
+        let mut loading = loading(receiver);
+        // Below the last checkpoints nothing starts, and no sequence is
+        // owed while the loader is still running.
+        loading.progress.advance_to(0.90);
+        loading.maybe_start_boot_finish();
+        assert!(loading.finishing.is_none());
+        assert!(loading.boot_finish_done());
+        // At the 0.95 band the sequence starts as part of loading
+        // itself; the bar goes full (the only place 1.0 is set) and
+        // the handoff owes the sequence until it plays out.
+        loading.progress.advance_to(0.95);
+        loading.maybe_start_boot_finish();
+        assert!(loading.finishing.is_some());
+        assert_eq!(loading.progress.fraction(), 1.0);
+        assert!(!loading.boot_finish_done());
+        // This load just started, so its length clamps to the floor.
+        assert_eq!(
+            loading.finishing_len,
+            horizon_client::ui_theme::BOOT_SEQ_MIN
+        );
+        // Once it has played out, nothing more is owed.
+        loading.finishing =
+            Instant::now().checked_sub(loading.finishing_len + Duration::from_millis(10));
+        assert!(loading.boot_finish_done());
+    }
+
+    #[test]
+    fn a_queued_entry_and_a_loader_error_both_skip_the_sequence() {
+        {
+            let (_send, receiver) = std::sync::mpsc::channel();
+            let mut loading = loading(receiver);
+            loading.menu.queue_entry(
+                Action::Connect {
+                    address: "localhost:25565".into(),
+                    lan: true,
+                },
+                "Guest".into(),
+            );
+            loading.progress.advance_to(0.97);
+            loading.maybe_start_boot_finish();
+            assert!(
+                loading.finishing.is_none(),
+                "suppressed by the queued entry"
+            );
+            assert!(loading.boot_finish_done(), "nothing owed");
+        }
+        {
+            let (_send, receiver) = std::sync::mpsc::channel();
+            let mut loading = loading(receiver);
+            loading.loaded = Some(Err("core failure".into()));
+            loading.progress.advance_to(0.97);
+            loading.maybe_start_boot_finish();
+            assert!(loading.finishing.is_none(), "skipped on error");
+            assert!(loading.boot_finish_done(), "nothing owed");
+        }
+    }
+
+    #[test]
+    fn the_sequence_dissolves_into_the_title_and_then_leaves_it_alone() {
+        let root = std::env::temp_dir().join("horizon-startup-menu-boot-dissolve");
+        let (_send, receiver) = std::sync::mpsc::channel();
+        let mut loading = loading(receiver);
+        loading.set_ui(gui(&root), root.clone());
+        // (a) Before the trigger the batch is the boot screen alone:
+        // its opaque black field is the frame's base quad — under the
+        // old flow the title's quads came first — and `draw_menu`
+        // reports no title in the batch (a vertex count can't say this:
+        // the shared glyph cache changes text-quad counts between a
+        // first and a second draw).
+        let mut batch = HudBatch::new([1280, 720]);
+        assert!(!loading.draw_menu(&mut batch));
+        assert!(!batch.vertices.is_empty());
+        let (w, h) = (batch.width, batch.height);
+        let bg = &batch.vertices[..6];
+        assert!(bg.iter().all(|v| v.color == 0xFF00_0000), "boot fill first");
+        assert!(bg.iter().all(|v| v.pos[0] == 0.0 || v.pos[0] == w));
+        assert!(bg.iter().all(|v| v.pos[1] == 0.0 || v.pos[1] == h));
+        // (b) Mid-fade the title is in the batch, under the boot layer:
+        // the boot fill is a full-screen pure-black quad whose alpha is
+        // the sequence's own fade (about 32 at 2.75s of 3.6s — the
+        // title's own full-screen dim sits at 160, so a low alpha is
+        // the boot field's alone), and it does not come first.
+        loading.finishing = Instant::now().checked_sub(Duration::from_millis(2750));
+        let mut batch = HudBatch::new([1280, 720]);
+        assert!(loading.draw_menu(&mut batch), "the title is the underlay");
+        let (w, h) = (batch.width, batch.height);
+        let fill_at = batch.vertices.iter().position(|v| {
+            v.color & 0x00FF_FFFF == 0
+                && (1..=64).contains(&(v.color >> 24))
+                && (v.pos == [0.0, 0.0]
+                    || v.pos == [w, 0.0]
+                    || v.pos == [0.0, h]
+                    || v.pos == [w, h])
+        });
+        assert!(
+            matches!(fill_at, Some(at) if at > 0),
+            "the boot fill rides the fade, over title quads drawn first"
+        );
+        // (c) After the sequence the boot screen contributes nothing:
+        // the frame is exactly what the screens alone draw (the title
+        // has its own full-screen dim quad, so "no black quad" can't
+        // say this — a batch with zero boot quads in it can).
+        loading.finishing = Instant::now().checked_sub(Duration::from_millis(3700));
+        let mut batch = HudBatch::new([1280, 720]);
+        assert!(loading.draw_menu(&mut batch), "the title is live");
+        let mut screens_only = HudBatch::new([1280, 720]);
+        assert!(loading.draw_screens(&mut screens_only));
+        assert_eq!(
+            batch.vertices.len(),
+            screens_only.vertices.len(),
+            "no boot quads left on the title's frame"
+        );
     }
 
     #[test]

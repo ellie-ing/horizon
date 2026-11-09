@@ -543,15 +543,28 @@ impl<'a> Ui<'a> {
 // (`horizon_threads::boot_paint`) mirrors the same proportions
 // statically, so the painted frame and the first wgpu frame agree.
 //
-// When the loader finishes, `draw_boot` is called with `finish` set and
-// plays the finish sequence (see `boot_phase`): the bar flashes and
-// fades out completely, only then the lockup bounces with its
-// afterimages, then everything fades to the pure black the title takes
-// over from.
+// The finish sequence (see `boot_phase`) starts at the loader's last
+// checkpoints, as the tail of loading itself: the bar flashes and fades
+// out completely, only then the lockup bounces with its afterimages,
+// then the whole screen thins out over the title already drawn beneath
+// it — the fade reveals the homescreen, it never fades to black.
 
-/// The finish sequence's whole length; `Loading` withholds the handoff
-/// for exactly this long once it starts the sequence.
+/// The finish sequence's reference length, and its ceiling: the design
+/// timeline below is authored against this many seconds, and a slow
+/// boot plays the sequence at exactly this speed, never slower.
 pub const BOOT_SEQ_TOTAL: Duration = Duration::from_millis(3600);
+/// The finish sequence's floor: however fast the boot, the bounce and
+/// its afterimages need this long to stay readable.
+pub const BOOT_SEQ_MIN: Duration = Duration::from_millis(1800);
+
+/// How long the finish sequence runs for a load that took
+/// `load_elapsed` to reach its last checkpoints: a quarter of the load's
+/// own time, clamped into [BOOT_SEQ_MIN, BOOT_SEQ_TOTAL] — quick boots
+/// finish quick, slow boots get the design's full speed, nothing ever
+/// runs slower than the design.
+pub fn boot_seq_duration(load_elapsed: Duration) -> Duration {
+    (load_elapsed / 4).clamp(BOOT_SEQ_MIN, BOOT_SEQ_TOTAL)
+}
 /// The bar is fully faded out at this sequence time...
 const BOOT_BAR_END: f32 = 0.80;
 /// ...and only here does the bounce begin: the two never overlap.
@@ -588,11 +601,11 @@ fn keys_at(keys: &[(f32, f32)], t: f32) -> f32 {
 }
 
 /// One element's bounce at sequence time `t`: the design's keyframe
-/// shape as `(u, scale, dy)` triples (dy in design px), run over
-/// `BOOT_BOUNCE_LEN` from `start`. Before the bounce the element rests;
+/// shape as `(u, scale, dy)` triples (dy in design px), run over `len`
+/// from `start`. Before the bounce the element rests;
 /// after it, it keeps its final keyframe until the fade takes it.
-fn bounce_at(keys: &[(f32, f32, f32)], start: f32, t: f32) -> (f32, f32) {
-    let u = (t - start) / BOOT_BOUNCE_LEN;
+fn bounce_at(keys: &[(f32, f32, f32)], start: f32, len: f32, t: f32) -> (f32, f32) {
+    let u = (t - start) / len;
     if u <= 0.0 {
         return (1.0, 0.0);
     }
@@ -670,7 +683,7 @@ pub(crate) struct BootPhase {
     /// The starfield's own, later fade.
     pub star_fade: f32,
     pub halo_fade: f32,
-    /// The sequence has played out: nothing but the black field.
+    /// The sequence has played out: the boot screen draws nothing.
     pub done: bool,
 }
 
@@ -695,25 +708,39 @@ impl BootPhase {
 }
 
 /// The finish sequence at `finish` seconds from its trigger (or the
-/// neutral loading state for `None`).
-pub(crate) fn boot_phase(finish: Option<f32>) -> BootPhase {
+/// neutral loading state for `None`), on a timeline of `seq_total`
+/// seconds: the design's keys are authored against `BOOT_SEQ_TOTAL`
+/// and scale proportionally, so the ordering (bar gone before the
+/// bounce, ghosts inside the bounce, stars fading last) holds at any
+/// total in [BOOT_SEQ_MIN, BOOT_SEQ_TOTAL].
+pub(crate) fn boot_phase(finish: Option<f32>, seq_total: f32) -> BootPhase {
     let Some(t) = finish else {
         return BootPhase::NEUTRAL;
     };
-    // The bar: holds, flashes bright once (peak 0.15s), then fades out
-    // while dropping; by BOOT_BAR_END it is gone, before anything moves.
-    let fade_u = ease_out((t - 0.15) / (BOOT_BAR_END - 0.15));
+    let s = seq_total / BOOT_SEQ_TOTAL.as_secs_f32();
+    let bar_end = BOOT_BAR_END * s;
+    let bounce_start = BOOT_BOUNCE_AT * s;
+    let bounce_len = BOOT_BOUNCE_LEN * s;
+    let flash_at = 0.15 * s;
+    // The bar: holds, flashes bright once (peak at the flash key), then
+    // fades out while dropping; by the bar key it is gone, before
+    // anything moves.
+    let fade_u = ease_out((t - flash_at) / (bar_end - flash_at));
     let bar_alpha = 1.0 - fade_u;
-    let bar_flash = if t <= 0.15 { t / 0.15 } else { 1.0 - fade_u };
-    let (logo_scale, logo_dy) = bounce_at(&LOGO_BOUNCE, BOOT_BOUNCE_AT, t);
-    let (gem_scale, gem_dy) = bounce_at(&GEM_BOUNCE, BOOT_BOUNCE_AT + 0.02, t);
-    let (tag_scale, tag_dy) = bounce_at(&TAG_BOUNCE, BOOT_BOUNCE_AT + 0.04, t);
+    let bar_flash = if t <= flash_at {
+        t / flash_at
+    } else {
+        1.0 - fade_u
+    };
+    let (logo_scale, logo_dy) = bounce_at(&LOGO_BOUNCE, bounce_start, bounce_len, t);
+    let (gem_scale, gem_dy) = bounce_at(&GEM_BOUNCE, bounce_start + 0.02 * s, bounce_len, t);
+    let (tag_scale, tag_dy) = bounce_at(&TAG_BOUNCE, bounce_start + 0.04 * s, bounce_len, t);
     // The fade-out: everything rises slightly and scales a touch as it
-    // goes, the stars starting later and ending last, on pure black.
-    let out_u = ease_out((t - BOOT_FADE_AT) / 1.0);
+    // goes, the stars starting later and ending last.
+    let out_u = ease_out((t - BOOT_FADE_AT * s) / s);
     let mut ghosts = [(0.0f32, 1.0f32); 3];
     for (g, &(delay, dur, peak, target)) in ghosts.iter_mut().zip(&BOOT_GHOSTS) {
-        let u = (t - (BOOT_BOUNCE_AT + delay)) / dur;
+        let u = (t - (bounce_start + delay * s)) / (dur * s);
         if (0.0..=1.0).contains(&u) {
             let a = if u < 0.14 {
                 peak * (u / 0.14)
@@ -735,9 +762,9 @@ pub(crate) fn boot_phase(finish: Option<f32>) -> BootPhase {
         tag_dy: tag_dy - 6.0 * out_u,
         ghosts,
         fade: 1.0 - out_u,
-        star_fade: 1.0 - ease_out((t - BOOT_STAR_FADE_AT) / 1.2),
-        halo_fade: 1.0 - ease_out((t - (BOOT_FADE_AT + 0.05)) / 1.3),
-        done: t >= BOOT_SEQ_TOTAL.as_secs_f32(),
+        star_fade: 1.0 - ease_out((t - BOOT_STAR_FADE_AT * s) / (1.2 * s)),
+        halo_fade: 1.0 - ease_out((t - (BOOT_FADE_AT + 0.05) * s) / (1.3 * s)),
+        done: t >= seq_total,
     }
 }
 
@@ -1604,28 +1631,40 @@ fn boot_bar(ui: &mut Ui, fraction: f32, et: f32, phase: &BootPhase) {
 /// is the bar's displayed fraction (the caller eases it toward the
 /// loader's real fraction, so it never claims more than has loaded);
 /// `elapsed` drives the ambient animation; `finish`, when set, is the
-/// finish sequence's elapsed time.
+/// finish sequence's elapsed time, played over a `seq_total` timeline.
+///
+/// With `overlay` set the caller has already drawn the title into the
+/// same batch: the black field then carries the sequence's own fade —
+/// opaque until the fade window, thinning to nothing at its end — so
+/// the sequence dissolves into the title beneath instead of covering
+/// it with black. Once the sequence is done this draws nothing at all,
+/// in either mode: no fill, no elements.
 pub fn draw_boot(
     atlas: &HudAtlas,
     batch: &mut HudBatch,
     fraction: f32,
     elapsed: Duration,
     finish: Option<Duration>,
+    seq_total: Duration,
+    overlay: bool,
 ) {
+    let phase = boot_phase(finish.map(|f| f.as_secs_f32()), seq_total.as_secs_f32());
+    if phase.done {
+        return;
+    }
     // Pure black under everything: the frame's panorama (the title
-    // artwork once the bundle is in) must not leak through.
+    // artwork once the bundle is in) must not leak through. In overlay
+    // mode the field itself fades with the sequence, revealing the
+    // title the caller drew underneath.
+    let fill_alpha = if overlay { phase.fade } else { 1.0 };
     batch.fill(
         atlas,
         0.0,
         0.0,
         batch.width,
         batch.height,
-        color::hex(0x000000, 255),
+        boot_rgba(0x000000, fill_alpha),
     );
-    let phase = boot_phase(finish.map(|f| f.as_secs_f32()));
-    if phase.done {
-        return;
-    }
     let et = elapsed.as_secs_f32();
     let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
     let mark = boot_mark(&ui);
@@ -1690,7 +1729,15 @@ mod tests {
         reset_atlas();
         let atlas = HudAtlas::boot();
         let mut batch = HudBatch::new([1280, 720]);
-        draw_boot(&atlas, &mut batch, 0.5, Duration::from_secs(2), None);
+        draw_boot(
+            &atlas,
+            &mut batch,
+            0.5,
+            Duration::from_secs(2),
+            None,
+            BOOT_SEQ_TOTAL,
+            false,
+        );
         // The first quad is the pure black backdrop over the frame's panorama.
         let (w, h) = (batch.width, batch.height);
         let bg = &batch.vertices[..6];
@@ -1725,7 +1772,15 @@ mod tests {
         );
         // At full fraction the bar's fill reaches toward the right margin.
         let mut batch = HudBatch::new([1280, 720]);
-        draw_boot(&atlas, &mut batch, 1.0, Duration::from_secs(2), None);
+        draw_boot(
+            &atlas,
+            &mut batch,
+            1.0,
+            Duration::from_secs(2),
+            None,
+            BOOT_SEQ_TOTAL,
+            false,
+        );
         let bar_max_x = batch
             .vertices
             .iter()
@@ -1742,23 +1797,26 @@ mod tests {
     #[test]
     fn the_finish_sequence_keeps_its_order() {
         // Loading: the neutral phase.
-        let p = boot_phase(None);
+        let p = boot_phase(None, BOOT_SEQ_TOTAL.as_secs_f32());
         assert_eq!(p.bar_alpha, 1.0);
         assert_eq!(p.logo_scale, 1.0);
         assert!(p.ghosts.iter().all(|g| g.0 == 0.0));
         // The bar holds and flashes first.
-        let p = boot_phase(Some(0.15));
+        let p = boot_phase(Some(0.15), BOOT_SEQ_TOTAL.as_secs_f32());
         assert_eq!(p.bar_alpha, 1.0);
         assert!((p.bar_flash - 1.0).abs() < 1e-6);
         // It is fully gone before the bounce begins, and stays gone.
         for t in [BOOT_BAR_END, 0.85, 0.90, BOOT_BOUNCE_AT - 0.01] {
-            let p = boot_phase(Some(t));
+            let p = boot_phase(Some(t), BOOT_SEQ_TOTAL.as_secs_f32());
             assert_eq!(p.bar_alpha, 0.0, "bar gone at {t}");
             assert_eq!(p.logo_scale, 1.0, "no bounce yet at {t}");
             assert!(p.ghosts.iter().all(|g| g.0 == 0.0), "no ghosts at {t}");
         }
         // The bounce overshoots on the design's keyframe (28% of 1.15s).
-        let p = boot_phase(Some(BOOT_BOUNCE_AT + 0.28 * BOOT_BOUNCE_LEN));
+        let p = boot_phase(
+            Some(BOOT_BOUNCE_AT + 0.28 * BOOT_BOUNCE_LEN),
+            BOOT_SEQ_TOTAL.as_secs_f32(),
+        );
         assert!(
             (p.logo_scale - 1.065).abs() < 0.01,
             "logo overshoot: {}",
@@ -1766,21 +1824,143 @@ mod tests {
         );
         assert!(p.gem_scale > 1.0 && p.gem_scale < p.logo_scale);
         // Ghosts exist only inside the bounce window.
-        let p = boot_phase(Some(BOOT_BOUNCE_AT + 0.25));
+        let p = boot_phase(Some(BOOT_BOUNCE_AT + 0.25), BOOT_SEQ_TOTAL.as_secs_f32());
         assert!(p.ghosts[0].0 > 0.0 && p.ghosts[0].1 > 1.0);
-        let p = boot_phase(Some(3.0));
+        let p = boot_phase(Some(3.0), BOOT_SEQ_TOTAL.as_secs_f32());
         assert!(
             p.ghosts.iter().all(|g| g.0 == 0.0),
             "ghosts spent by the fade"
         );
         // The fade runs after the bounce, the stars last, and the
         // sequence ends on black within its total length.
-        assert_eq!(boot_phase(Some(2.0)).fade, 1.0);
-        let p = boot_phase(Some(3.0));
+        assert_eq!(
+            boot_phase(Some(2.0), BOOT_SEQ_TOTAL.as_secs_f32()).fade,
+            1.0
+        );
+        let p = boot_phase(Some(3.0), BOOT_SEQ_TOTAL.as_secs_f32());
         assert!(p.fade < 0.2 && p.star_fade > p.fade, "stars fade last");
-        let p = boot_phase(Some(BOOT_SEQ_TOTAL.as_secs_f32()));
+        let p = boot_phase(
+            Some(BOOT_SEQ_TOTAL.as_secs_f32()),
+            BOOT_SEQ_TOTAL.as_secs_f32(),
+        );
         assert!(p.done);
         assert_eq!(p.star_fade, 0.0);
         assert_eq!(p.fade, 0.0);
+    }
+
+    #[test]
+    fn the_finish_sequence_keeps_its_order_at_any_total() {
+        // The timeline scales proportionally: whatever the adaptive
+        // total, the bar is gone before the bounce, the ghosts live
+        // inside the bounce, the fade runs after it and the stars end
+        // last, exactly at the total.
+        for total in [1.8f32, 2.5, 3.6] {
+            let s = total / BOOT_SEQ_TOTAL.as_secs_f32();
+            // Bar fully gone at its key, and nothing has bounced yet.
+            for t in [BOOT_BAR_END * s, BOOT_BOUNCE_AT * s - 0.01 * s] {
+                let p = boot_phase(Some(t), total);
+                assert_eq!(p.bar_alpha, 0.0, "bar gone at {t} of {total}");
+                assert_eq!(p.logo_scale, 1.0, "no bounce yet at {t} of {total}");
+                assert!(
+                    p.ghosts.iter().all(|g| g.0 == 0.0),
+                    "no ghosts at {t} of {total}"
+                );
+            }
+            // The bounce overshoots on the same keyframe shape.
+            let p = boot_phase(Some((BOOT_BOUNCE_AT + 0.28 * BOOT_BOUNCE_LEN) * s), total);
+            assert!(
+                (p.logo_scale - 1.065).abs() < 0.01,
+                "logo overshoot at total {total}: {}",
+                p.logo_scale
+            );
+            // Ghosts exist only inside the bounce window.
+            let p = boot_phase(Some((BOOT_BOUNCE_AT + 0.25) * s), total);
+            assert!(p.ghosts[0].0 > 0.0 && p.ghosts[0].1 > 1.0);
+            // No fade before its key; mid-fade the stars linger longest.
+            assert_eq!(boot_phase(Some(2.0 * s), total).fade, 1.0);
+            let p = boot_phase(Some(2.75 * s), total);
+            assert!(
+                p.fade < 0.2 && p.star_fade > p.fade,
+                "stars fade last at total {total}"
+            );
+            assert!(p.ghosts.iter().all(|g| g.0 == 0.0), "ghosts spent");
+            // The sequence ends exactly at its total, not the reference.
+            assert!(!boot_phase(Some(total - 0.01), total).done);
+            let p = boot_phase(Some(total), total);
+            assert!(p.done, "done at {total}");
+            assert_eq!(p.star_fade, 0.0);
+            assert_eq!(p.fade, 0.0);
+        }
+    }
+
+    #[test]
+    fn the_sequence_length_follows_the_load_and_never_exceeds_the_design() {
+        // A quarter of the load's time, floored so the bounce stays
+        // readable and capped at the design's own length.
+        assert_eq!(boot_seq_duration(Duration::from_secs(0)), BOOT_SEQ_MIN);
+        assert_eq!(boot_seq_duration(Duration::from_secs(4)), BOOT_SEQ_MIN);
+        assert_eq!(boot_seq_duration(Duration::from_millis(7200)), BOOT_SEQ_MIN);
+        assert_eq!(
+            boot_seq_duration(Duration::from_secs(10)),
+            Duration::from_millis(2500)
+        );
+        assert_eq!(
+            boot_seq_duration(Duration::from_millis(14_400)),
+            BOOT_SEQ_TOTAL
+        );
+        assert_eq!(boot_seq_duration(Duration::from_secs(600)), BOOT_SEQ_TOTAL);
+    }
+
+    #[test]
+    fn the_overlay_fill_rides_the_sequence_fade_and_done_draws_nothing() {
+        reset_atlas();
+        let atlas = HudAtlas::boot();
+        // Mid-fade the overlay's black field is exactly the sequence's
+        // fade, not an opaque cover: the title underneath shows through
+        // by precisely that much.
+        let t = 2.75;
+        let phase = boot_phase(Some(t), BOOT_SEQ_TOTAL.as_secs_f32());
+        assert!(phase.fade > 0.0 && phase.fade < 1.0);
+        let mut batch = HudBatch::new([1280, 720]);
+        draw_boot(
+            &atlas,
+            &mut batch,
+            1.0,
+            Duration::from_secs(2),
+            Some(Duration::from_secs_f32(t)),
+            BOOT_SEQ_TOTAL,
+            true,
+        );
+        let bg = &batch.vertices[..6];
+        assert!(
+            bg.iter()
+                .all(|v| v.color == boot_rgba(0x000000, phase.fade))
+        );
+        // Before the fade window the field is still fully opaque.
+        let mut batch = HudBatch::new([1280, 720]);
+        draw_boot(
+            &atlas,
+            &mut batch,
+            1.0,
+            Duration::from_secs(2),
+            Some(Duration::from_secs(1)),
+            BOOT_SEQ_TOTAL,
+            true,
+        );
+        assert!(batch.vertices[..6].iter().all(|v| v.color == 0xFF00_0000));
+        // At the end of the sequence the boot screen contributes
+        // nothing at all — no fill lands on the title's frame.
+        let mut batch = HudBatch::new([1280, 720]);
+        draw_boot(
+            &atlas,
+            &mut batch,
+            1.0,
+            Duration::from_secs(2),
+            Some(BOOT_SEQ_TOTAL),
+            BOOT_SEQ_TOTAL,
+            true,
+        );
+        assert!(batch.vertices.is_empty(), "done draws nothing");
+        reset_atlas();
     }
 }
