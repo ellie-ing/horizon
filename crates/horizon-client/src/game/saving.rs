@@ -268,11 +268,17 @@ impl Game<'_> {
             Some(Stage::Writes) => 0.9,
             _ => 0.0,
         };
-        horizon_client::level_loading::draw_progress(
-            &mut hud,
+        let caption = horizon_client::ui_theme::onyx_caption("Saving world...");
+        horizon_client::ui_theme::draw_onyx_loading(
             &self.gui.atlas,
-            "Saving world...",
-            progress,
+            &mut hud,
+            horizon_client::ui_theme::OnyxLoading {
+                caption: &caption,
+                fraction: Some(progress),
+                elapsed: self.started.elapsed(),
+                finishing: None,
+                wordmark: false,
+            },
         );
         renderer.render(&loading_frame(&hud))?;
         Ok(())

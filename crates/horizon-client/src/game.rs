@@ -2435,6 +2435,10 @@ struct Game<'a> {
     /// A pack reload staged on a worker (`LoadingOverlay`): the frame draws
     /// its progress until `drive_pack_reload` applies it.
     pack_reload: Option<packs::PackReload>,
+    /// ONYX fork: the pack reload overlay's exit, kept after the reload
+    /// applied: the finished frame (bar full, last stage line) held,
+    /// then faded, per the loading kit's exit grammar.
+    pack_reload_fade: Option<packs::PackReloadFade>,
     /// A server's resource packs (game/server_packs.rs).
     server_packs: server_packs::ServerPackState,
     /// The link a chat click asks to open (`ConfirmLinkScreen`).
@@ -16032,12 +16036,14 @@ impl Game<'_> {
                 });
                 if let Some(renderer) = &mut self.renderer {
                     let mut hud = HudBatch::new([renderer.config.width, renderer.config.height]);
-                    horizon_client::level_loading::draw_file_fixer(
+                    horizon_client::level_loading::draw_file_fixer_onyx(
                         &mut hud,
                         &self.gui.atlas,
                         upgrade,
                         self.cursor,
+                        self.started.elapsed(),
                     );
+                    horizon_client::ui_theme::draw_onyx_wordmark(&self.gui.atlas, &mut hud);
                     return renderer.render(&loading_frame(&hud));
                 }
                 return Ok(false);
@@ -16071,11 +16077,12 @@ impl Game<'_> {
                     .as_ref()
                     .is_some_and(|v| v.has_progress())
                     .then_some(self.loading_progress);
-                horizon_client::level_loading::draw(
+                horizon_client::level_loading::draw_onyx(
                     &mut hud,
                     &self.gui.atlas,
                     Some(&status),
                     progress,
+                    self.started.elapsed(),
                 );
                 return renderer.render(&loading_frame(&hud));
             }
@@ -16087,11 +16094,17 @@ impl Game<'_> {
                     screen_info::level_loading(Some(loader.progress.fraction()), &screen_info::tr)
                 });
                 let mut hud = HudBatch::new([renderer.config.width, renderer.config.height]);
-                horizon_client::level_loading::draw_progress(
-                    &mut hud,
+                let caption = horizon_client::ui_theme::onyx_caption(loader.progress.line());
+                horizon_client::ui_theme::draw_onyx_loading(
                     &self.gui.atlas,
-                    loader.progress.line(),
-                    loader.progress.fraction(),
+                    &mut hud,
+                    horizon_client::ui_theme::OnyxLoading {
+                        caption: &caption,
+                        fraction: Some(loader.progress.fraction()),
+                        elapsed: self.started.elapsed(),
+                        finishing: None,
+                        wordmark: false,
+                    },
                 );
                 return renderer.render(&loading_frame(&hud));
             }
@@ -16102,16 +16115,51 @@ impl Game<'_> {
         if let Some(reload) = &self.pack_reload {
             if let Some(renderer) = &mut self.renderer {
                 let mut hud = HudBatch::new([renderer.config.width, renderer.config.height]);
-                horizon_client::level_loading::draw_loading_overlay(
-                    &mut hud,
+                let caption = horizon_client::ui_theme::onyx_caption(reload.progress.line());
+                horizon_client::ui_theme::draw_onyx_loading(
                     &self.gui.atlas,
-                    reload.progress.line(),
-                    reload.progress.fraction(),
-                    self.settings.file.bool("darkMojangStudiosBackground"),
+                    &mut hud,
+                    horizon_client::ui_theme::OnyxLoading {
+                        caption: &caption,
+                        fraction: Some(reload.progress.fraction()),
+                        elapsed: self.started.elapsed(),
+                        finishing: None,
+                        wordmark: true,
+                    },
                 );
                 return renderer.render(&loading_frame(&hud));
             }
             return Ok(false);
+        }
+        // ONYX fork: the applied reload's exit — the finished frame
+        // held, then faded — before the game underneath takes the
+        // frame back. A failed reload never gets here: its rollback or
+        // error screen took the frame at once, as vanilla.
+        if self.pack_reload_fade.is_some() {
+            let (caption, done_for) = {
+                let fade = self.pack_reload_fade.as_ref().unwrap();
+                (fade.caption.clone(), fade.at.elapsed())
+            };
+            if horizon_client::ui_theme::onyx_exit_alpha(done_for).is_some() {
+                if let Some(renderer) = &mut self.renderer {
+                    let mut hud =
+                        HudBatch::new([renderer.config.width, renderer.config.height]);
+                    horizon_client::ui_theme::draw_onyx_loading(
+                        &self.gui.atlas,
+                        &mut hud,
+                        horizon_client::ui_theme::OnyxLoading {
+                            caption: &caption,
+                            fraction: Some(1.0),
+                            elapsed: self.started.elapsed(),
+                            finishing: Some(done_for),
+                            wordmark: true,
+                        },
+                    );
+                    return renderer.render(&loading_frame(&hud));
+                }
+                return Ok(false);
+            }
+            self.pack_reload_fade = None;
         }
         let Some(size) = self
             .renderer
@@ -19355,6 +19403,7 @@ impl<'a> Game<'a> {
             pending_pack_reload: false,
             pack_folder: None,
             pack_reload: None,
+            pack_reload_fade: None,
             server_packs: Default::default(),
             link_prompt: None,
             command_prompt: None,

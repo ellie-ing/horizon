@@ -279,6 +279,8 @@ impl Game<'_> {
     /// progress meanwhile, and the overlay takes no input (`LoadingOverlay`),
     /// so what is held is released (`KeyMapping.releaseAll`).
     pub(super) fn spawn_pack_reload(&mut self, kind: ReloadKind) -> std::io::Result<()> {
+        // ONYX fork: a new reload's overlay supersedes the last one's exit.
+        self.pack_reload_fade = None;
         self.keys.clear();
         self.physical_keys.clear();
         self.left = false;
@@ -312,12 +314,18 @@ impl Game<'_> {
     /// applied on the render thread, and its outcome goes to whoever asked
     /// (`reloadResourcePacks`' callback, or `PackReloadConfig.Callbacks`).
     pub(super) fn drive_pack_reload(&mut self) {
+        // ONYX fork: the overlay's last line, kept for its exit fade.
+        let caption = self
+            .pack_reload
+            .as_ref()
+            .map(|reload| horizon_client::ui_theme::onyx_caption(reload.progress.line()));
         let Some((kind, staged)) = self.pack_reload.as_mut().and_then(PackReload::finished) else {
             return;
         };
         self.pack_reload = None;
         let result =
             staged.and_then(|staged| self.apply_staged_pack(staged).map_err(|e| e.to_string()));
+        let applied = result.is_ok();
         match kind {
             ReloadKind::Selection => {
                 if let Err(e) = result {
@@ -330,6 +338,15 @@ impl Game<'_> {
                 }
                 self.finish_pack_reload(result.is_ok());
             }
+        }
+        // ONYX fork: a reload that applied plays the kit's exit (the
+        // finished frame held, then faded). A failed one does not: its
+        // rollback or error screen takes the frame at once, as vanilla.
+        if applied && let Some(caption) = caption {
+            self.pack_reload_fade = Some(PackReloadFade {
+                at: std::time::Instant::now(),
+                caption,
+            });
         }
     }
     /// The render-thread half: the renderer on the new pack's textures, then
@@ -651,6 +668,16 @@ impl PackReload {
             .unwrap_or_else(|_| Err("the pack reload worker panicked".into()));
         Some((self.kind, staged))
     }
+}
+
+/// ONYX fork: an applied pack reload's exit, kept by the frame after
+/// `drive_pack_reload`: the overlay's last stage line (already resolved
+/// as the kit's caption) and when the reload applied, so the frame can
+/// hold the finished bar and fade it per the loading kit's exit
+/// grammar.
+pub(super) struct PackReloadFade {
+    pub(super) at: std::time::Instant,
+    pub(super) caption: String,
 }
 
 #[cfg(test)]

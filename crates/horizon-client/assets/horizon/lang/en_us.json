@@ -795,5 +795,18 @@
   "Editing: %s": "Editing: %s",
   "Press the button for this. %s cancels.": "Press the button for this. %s cancels.",
   "This button also does: %s": "This button also does: %s",
-  "horizon.pad.notice.connected.press": "Press to use it"
+  "horizon.pad.notice.connected.press": "Press to use it",
+  "horizon.loading.loading_menu": "Loading menu",
+  "horizon.loading.loading_assets": "Loading assets",
+  "horizon.loading.loading_block_facts": "Loading block facts",
+  "horizon.loading.loading_biomes": "Loading biomes",
+  "horizon.loading.loading_pack_tables": "Loading pack tables",
+  "horizon.loading.loading_collision": "Loading collision",
+  "horizon.loading.loading_items": "Loading items",
+  "horizon.loading.loading_recipes": "Loading recipes",
+  "horizon.loading.loading_world_resources": "Loading world resources",
+  "horizon.loading.world_resources_ready": "World resources ready",
+  "horizon.loading.preparing_resources": "Preparing resources",
+  "horizon.loading.applying_resources": "Applying resources",
+  "horizon.loading.saving_world": "Saving world..."
 }

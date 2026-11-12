@@ -2523,10 +2523,23 @@ Would you like to enable the Narrator or visit the Accessibility Settings?",
             // `FocusableTextWidget.builder(title, font, 12)`: 12 pixels of
             // padding around the text, on a black box with a 1-pixel border.
             let (bx, by) = (tx - 12.0, ty - 12.0);
-            let (bw, bh) = (tw + 24.0, 9.0 + 24.0);
-            batch.fill(atlas, bx - 1.0, by - 1.0, bw + 2.0, bh + 2.0, 0xFFD0D0D0);
+            // ONYX fork: the box wears the kit's register — a white
+            // border on black — and runs the kit's sweep under the
+            // message: world creation has no fraction to show. The box
+            // grows by the sweep's room; it stays a message box.
+            let (bw, bh) = (tw + 24.0, 9.0 + 24.0 + 10.0);
+            batch.fill(atlas, bx - 1.0, by - 1.0, bw + 2.0, bh + 2.0, u32::MAX);
             batch.fill(atlas, bx, by, bw, bh, 0xFF000000);
             batch.text(atlas, &text, tx, ty, u32::MAX, false);
+            crate::level_loading::draw_onyx_bar(
+                batch,
+                atlas,
+                bx + 12.0,
+                ty + 9.0 + 5.0,
+                bw - 24.0,
+                None,
+                self.started.elapsed(),
+            );
             return;
         }
         if let Some(screen) = self.confirm_experiments.borrow().as_ref() {

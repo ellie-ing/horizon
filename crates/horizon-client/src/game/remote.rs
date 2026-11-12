@@ -9945,9 +9945,21 @@ impl Game<'_> {
                 Some(view) => {
                     let status = |x: i32, z: i32| view.status(x, z);
                     let progress = view.has_progress().then_some(self.loading_progress);
-                    horizon_client::level_loading::draw(batch, atlas, Some(&status), progress);
+                    horizon_client::level_loading::draw_onyx(
+                        batch,
+                        atlas,
+                        Some(&status),
+                        progress,
+                        self.started.elapsed(),
+                    );
                 }
-                None => horizon_client::level_loading::draw(batch, atlas, None, None),
+                None => horizon_client::level_loading::draw_onyx(
+                    batch,
+                    atlas,
+                    None,
+                    None,
+                    self.started.elapsed(),
+                ),
             }
             return true;
         }
@@ -9978,7 +9990,14 @@ impl Game<'_> {
         });
         let atlas = &self.gui.atlas;
         let status = horizon_client::text::Text::literal(r.status.as_str());
-        horizon_client::level_loading::draw_connecting(batch, atlas, &status, self.cursor, cancel);
+        horizon_client::level_loading::draw_connecting_onyx(
+            batch,
+            atlas,
+            &status,
+            self.cursor,
+            cancel,
+            self.started.elapsed(),
+        );
         true
     }
     /// Connected or connecting with no player yet: `ConnectScreen`, then
@@ -10018,6 +10037,17 @@ impl Game<'_> {
         let title = horizon_client::text::Text::translate("connect.reconfiguring", &[]);
         let ((tx, ty), (bx, by)) = self.reconfigure_layout((w, h));
         batch.text_styled(atlas, &title, tx, ty, u32::MAX, true);
+        // ONYX fork: the wait has no fraction; the kit's bar sweeps
+        // under the title until the server answers or Disconnect wakes.
+        horizon_client::level_loading::draw_onyx_bar(
+            batch,
+            atlas,
+            bx,
+            ty + 14.0,
+            150.0,
+            None,
+            self.started.elapsed(),
+        );
         // CommonComponents.GUI_DISCONNECT
         let label = horizon_client::text::Text::translate("menu.disconnect", &[]);
         let active = self.ticks.saturating_sub(since) >= 600;

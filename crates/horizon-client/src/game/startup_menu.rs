@@ -1308,12 +1308,17 @@ impl Loading {
             return false;
         };
         if self.menu.pending.is_some() {
-            horizon_client::level_loading::draw_loading_overlay(
-                batch,
+            let caption = horizon_client::ui_theme::onyx_caption(self.progress.line());
+            horizon_client::ui_theme::draw_onyx_loading(
                 &gui.atlas,
-                self.progress.line(),
-                self.progress.fraction(),
-                self.settings.file.bool("darkMojangStudiosBackground"),
+                batch,
+                horizon_client::ui_theme::OnyxLoading {
+                    caption: &caption,
+                    fraction: Some(self.progress.fraction()),
+                    elapsed: self.started.elapsed(),
+                    finishing: None,
+                    wordmark: false,
+                },
             );
         } else if let Some((win, frame)) = &mut self.menu.win {
             let now = Instant::now();
