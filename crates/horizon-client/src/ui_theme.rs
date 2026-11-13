@@ -1571,6 +1571,15 @@ fn boot_tag(ui: &mut Ui, et: f32, phase: &BootPhase, mark: &BootMark) {
     boot_xf(ui, start, (cx, mark.cy), phase.tag_scale, phase.tag_dy * sy);
 }
 
+/// The boot bar's rect in dp: (x0, x1, y_top, height) at rest — the
+/// finish sequence's drop is the caller's to add. Shared by `boot_bar`
+/// and the loading kit, whose caption anchors to the bar's top edge.
+fn boot_bar_rect(ui: &Ui) -> (f32, f32, f32, f32) {
+    let sy = ui.h / 1080.0;
+    let h = 26.0 * sy;
+    (0.05 * ui.w, 0.95 * ui.w, ui.h - 88.0 * sy - h, h)
+}
+
 /// The progress bar: a thin white border, an inner white fill at the
 /// loader's fraction, a soft glow under it. During the finish sequence
 /// it flashes and fades away (`phase`).
@@ -1585,9 +1594,8 @@ fn boot_bar(ui: &mut Ui, fraction: f32, et: f32, phase: &BootPhase) {
     let sx = ui.w / 1920.0;
     let sy = ui.h / 1080.0;
     let m = sx.min(sy);
-    let (x0, x1) = (0.05 * ui.w, 0.95 * ui.w);
-    let h = 26.0 * sy;
-    let y = ui.h - 88.0 * sy - h + phase.bar_drop * sy;
+    let (x0, x1, y0, h) = boot_bar_rect(ui);
+    let y = y0 + phase.bar_drop * sy;
     let border = (2.0 * m).max(1.0);
     let pad = 3.0 * m;
     let white = boot_rgba(0xFFFFFF, a);
@@ -1624,6 +1632,20 @@ fn boot_bar(ui: &mut Ui, fraction: f32, et: f32, phase: &BootPhase) {
             white,
         );
     }
+}
+
+/// The boot scene at the phase it is handed: halo, stars, diamond,
+/// wordmark, seam, tag — everything `draw_boot` draws except the field
+/// and the bar. The finish sequence lives entirely in `boot_phase`'s
+/// math, so at `BootPhase::NEUTRAL` this is the at-rest scene: no
+/// bounce, no ghosts, no flash — which is what the loading kit wears.
+fn boot_scene(ui: &mut Ui, et: f32, phase: &BootPhase, mark: &BootMark) {
+    boot_halo(ui, et, phase);
+    boot_stars(ui, et, phase);
+    boot_diamond(ui, et, phase, mark);
+    boot_wordmark(ui, et, phase, mark);
+    boot_seam(ui, et, phase, mark);
+    boot_tag(ui, et, phase, mark);
 }
 
 /// The boot screen while the menu is not ready yet, and again while the
@@ -1668,12 +1690,7 @@ pub fn draw_boot(
     let et = elapsed.as_secs_f32();
     let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
     let mark = boot_mark(&ui);
-    boot_halo(&mut ui, et, &phase);
-    boot_stars(&mut ui, et, &phase);
-    boot_diamond(&mut ui, et, &phase, &mark);
-    boot_wordmark(&mut ui, et, &phase, &mark);
-    boot_seam(&mut ui, et, &phase, &mark);
-    boot_tag(&mut ui, et, &phase, &mark);
+    boot_scene(&mut ui, et, &phase, &mark);
     boot_bar(&mut ui, fraction, et, &phase);
     ui.finish();
 }
@@ -1681,18 +1698,18 @@ pub fn draw_boot(
 // ---- the ONYX loading kit ----
 //
 // ONYX fork: every loading surface past the boot screen wears the boot
-// screen's clothes: the same pure black field, the caption in the
-// boot's letterspaced mono register above a boot-style bar, and — for
-// the surfaces that run long — the static wordmark at rest. A surface
-// with no real fraction gets a bright segment sweeping the track
-// instead of a faked number. The exit is one compressed grammar
-// everywhere: the bar completes, holds ~200 ms, then the whole screen
-// fades over ~250 ms — the boot's own ceremony compressed into
-// 450 ms, because these surfaces hand over to gameplay, not to a
-// title screen. The full-screen treatment lives here, with the boot's
-// machinery; the composite screens (the chunk map, the file fixer, the
-// connect screens) keep their vanilla layouts and take the kit's bar
-// from `level_loading::draw_onyx_bar` instead.
+// screen itself. A surface that owns the whole frame and shows no data
+// or controls gets the boot scene at rest (`boot_scene` at
+// `BootPhase::NEUTRAL`: halo, starfield, diamond, the polished wordmark
+// with its seam and tag), a status caption in the boot tag's exact
+// register in the empty band above the bar, and the boot's own bar.
+// The boot's finish sequence stays boot-only — no surface here gains
+// the bounce, the ghosts or the flash; the one exit motion is the pack
+// reload's: the completed frame holds ~200 ms, then the whole scene
+// fades over ~250 ms (see `onyx_phase`). Surfaces that carry data,
+// buttons or another screen's context (the chunk map, the file fixer,
+// the connect screens) get the boot's bar construction and nothing
+// else, from `level_loading::draw_onyx_bar`.
 
 /// The kit's exit: how long the completed frame holds before the fade.
 pub const ONYX_EXIT_HOLD: Duration = Duration::from_millis(200);
@@ -1713,6 +1730,19 @@ pub fn onyx_exit_alpha(elapsed: Duration) -> Option<f32> {
     } else {
         1.0 - ease_out((t - hold) / ONYX_EXIT_FADE.as_secs_f32())
     })
+}
+
+/// `BootPhase::NEUTRAL` with every alpha the scene and the bar read
+/// set to `a`: the kit's exit fade expressed in boot-phase terms, so
+/// the kit keeps one draw path and no finish behaviour (bounce,
+/// ghosts, flash, drop) can leak in — those fields stay at rest.
+fn onyx_phase(a: f32) -> BootPhase {
+    let mut p = BootPhase::NEUTRAL;
+    p.fade = a;
+    p.star_fade = a;
+    p.halo_fade = a;
+    p.bar_alpha = a;
+    p
 }
 
 /// The indeterminate sweep: where the bright segment sits on a track
@@ -1753,15 +1783,7 @@ pub fn onyx_caption(line: &str) -> String {
 
 /// Letterspaced mono text centred on `cx`, the boot tag's register:
 /// each glyph on its own pen, advanced by `tracking` × size.
-fn onyx_tracked(
-    ui: &mut Ui,
-    text: &str,
-    size: f32,
-    tracking: f32,
-    cx: f32,
-    y: f32,
-    color: u32,
-) {
+fn onyx_tracked(ui: &mut Ui, text: &str, size: f32, tracking: f32, cx: f32, y: f32, color: u32) {
     if color >> 24 == 0 || text.is_empty() {
         return;
     }
@@ -1780,66 +1802,13 @@ fn onyx_tracked(
     }
 }
 
-/// The kit's bar in the boot bar's language: white border strips, a
-/// translucent track, the fill in the boot tag's pale periwinkle with
-/// a white leading segment. With no fraction, the bright segment
-/// sweeps instead (see `onyx_sweep`).
-fn onyx_bar(
-    ui: &mut Ui,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    fraction: Option<f32>,
-    elapsed: Duration,
-    alpha: f32,
-) {
-    let m = (ui.w / 1920.0).min(ui.h / 1080.0);
-    let border = (1.5 * m).max(1.0);
-    let pad = 2.0 * m;
-    let white = boot_rgba(0xFFFFFF, alpha);
-    ui.rounded(x, y, w, border, 0.0, white);
-    ui.rounded(x, y + h - border, w, border, 0.0, white);
-    ui.rounded(x, y, border, h, 0.0, white);
-    ui.rounded(x + w - border, y, border, h, 0.0, white);
-    let (ix, iw) = (x + pad, (w - 2.0 * pad).max(0.0));
-    let (iy, ih) = (y + pad, (h - 2.0 * pad).max(0.0));
-    if iw <= 0.0 || ih <= 0.0 {
-        return;
-    }
-    ui.rounded(ix, iy, iw, ih, 0.0, boot_rgba(0xFFFFFF, 0.14 * alpha));
-    match fraction {
-        Some(f) => {
-            let fill_w = iw * f.clamp(0.0, 1.0);
-            if fill_w > 0.0 {
-                ui.rounded(ix, iy, fill_w, ih, 0.0, boot_rgba(0xC3CCF7, 0.95 * alpha));
-                let lead = fill_w.min(18.0 * m);
-                ui.rounded(ix + fill_w - lead, iy, lead, ih, 0.0, white);
-            }
-        }
-        None => {
-            let (off, seg) = onyx_sweep(elapsed, iw);
-            let (sx0, sx1) = (ix + off.max(0.0), ix + (off + seg).min(iw));
-            if sx1 > sx0 {
-                ui.rounded(sx0, iy, sx1 - sx0, ih, 0.0, boot_rgba(0xC3CCF7, 0.55 * alpha));
-                let core = (sx1 - sx0) * 0.4;
-                ui.rounded(
-                    (sx0 + sx1) / 2.0 - core / 2.0,
-                    iy,
-                    core,
-                    ih,
-                    0.0,
-                    boot_rgba(0xFFFFFF, 0.9 * alpha),
-                );
-            }
-        }
-    }
-}
-
-/// The static ONYX wordmark at rest: the wordmark and its
-/// HORIZON CLIENT tag, no bounce, no ghosts, centred at 30% of the
-/// height — a third of the boot wordmark's span, present without being
-/// the headline.
+/// S10's mini wordmark: the wordmark and its HORIZON CLIENT tag as
+/// flat text, no bounce, no ghosts, centred at 30% of the height — a
+/// third of the boot wordmark's span. The world upgrade is the one
+/// full-screen surface that does not wear the boot scene: its own
+/// centred data text owns the frame's middle, where the lockup sits,
+/// so it takes the starfield backdrop (`draw_onyx_backdrop`) and this
+/// smaller mark above its content instead.
 fn onyx_wordmark(ui: &mut Ui, alpha: f32) {
     let m = (ui.w / 1920.0).min(ui.h / 1080.0);
     let size = 0.30 * ui.w * 100.0 / ui.measure(Face::SemiBold, 100.0, "ONYX").max(1.0);
@@ -1864,37 +1833,61 @@ fn onyx_wordmark(ui: &mut Ui, alpha: f32) {
     );
 }
 
-/// The static wordmark over another surface's own field: the composite
-/// screens (the world upgrade) draw their black field and content
-/// themselves and wear the wordmark through this entry point.
+/// S10's mini wordmark over its own field: the world upgrade draws
+/// its backdrop and content itself and wears the wordmark through
+/// this entry point.
 pub fn draw_onyx_wordmark(atlas: &HudAtlas, batch: &mut HudBatch) {
     let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
     onyx_wordmark(&mut ui, 1.0);
     ui.finish();
 }
 
+/// The boot scene's ambient half over a black field of the caller's
+/// own: the halo and the starfield at rest, nothing focal. For the
+/// world upgrade, whose centred data text owns the frame's middle —
+/// it wears the boot's sky without the lockup its text would collide
+/// with, then draws its content and mini wordmark over it.
+pub fn draw_onyx_backdrop(atlas: &HudAtlas, batch: &mut HudBatch, elapsed: Duration, alpha: f32) {
+    batch.fill(
+        atlas,
+        0.0,
+        0.0,
+        batch.width,
+        batch.height,
+        boot_rgba(0x000000, alpha),
+    );
+    let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
+    let phase = onyx_phase(alpha);
+    let et = elapsed.as_secs_f32();
+    boot_halo(&mut ui, et, &phase);
+    boot_stars(&mut ui, et, &phase);
+    ui.finish();
+}
+
 /// One full-screen ONYX loading surface, as `draw_onyx_loading` needs
 /// it. `caption` is already resolved (see `onyx_caption`); `fraction`
 /// is the surface's real progress, or `None` when the surface has
-/// none — the bar then runs its indeterminate sweep and never claims
-/// a number. `finishing`, when set, is the time since the surface
-/// completed: the bar reads full and the whole screen plays the kit's
-/// exit (see `onyx_exit_alpha`).
+/// none — the bar then reads empty and never claims a number.
+/// `elapsed` is the loader clock every kit surface already runs on —
+/// the same clock `draw_boot` runs on, so the scene's ambient motion
+/// (twinkle, comets, sheen) continues from the boot screen's own.
+/// `finishing`, when set, is the time since the surface completed:
+/// the bar reads full and the whole scene plays the kit's exit (see
+/// `onyx_exit_alpha`).
 pub struct OnyxLoading<'a> {
     pub caption: &'a str,
     pub fraction: Option<f32>,
     pub elapsed: Duration,
     pub finishing: Option<Duration>,
-    /// The static wordmark over the field: only the surfaces that run
-    /// long (the pack reload, the world upgrade) wear it.
-    pub wordmark: bool,
 }
 
-/// A full-screen loading surface in the boot screen's clothes: pure
-/// black field, the caption in letterspaced mono above the bar, the
-/// bar where the vanilla overlay put its own (centred, the old logo's
-/// measure wide, at 83.25% of the height). Once the finishing exit has
-/// played out this draws nothing at all.
+/// A full-screen loading surface: the boot screen itself, at rest,
+/// plus a caption. Pure black field, the boot scene (halo, starfield,
+/// diamond, the polished wordmark with its seam and tag), the caption
+/// in the boot tag's exact register — same face, size, tracking,
+/// colour and glow — in the empty band above the bar, and the boot's
+/// own bar. Once the finishing exit has played out this draws nothing
+/// at all.
 pub fn draw_onyx_loading(atlas: &HudAtlas, batch: &mut HudBatch, spec: OnyxLoading<'_>) {
     let alpha = match spec.finishing {
         Some(done_for) => match onyx_exit_alpha(done_for) {
@@ -1917,36 +1910,38 @@ pub fn draw_onyx_loading(atlas: &HudAtlas, batch: &mut HudBatch, spec: OnyxLoadi
         boot_rgba(0x000000, alpha),
     );
     let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
-    if spec.wordmark {
-        onyx_wordmark(&mut ui, alpha);
-    }
-    let m = (ui.w / 1920.0).min(ui.h / 1080.0);
-    let bar_w = (0.75 * ui.w).min(ui.h);
-    let bar_h = 12.0 * m;
-    let bar_x = (ui.w - bar_w) / 2.0;
-    let bar_y = 0.8325 * ui.h - bar_h / 2.0;
-    onyx_bar(
-        &mut ui,
-        bar_x,
-        bar_y,
-        bar_w,
-        bar_h,
-        fraction,
-        spec.elapsed,
-        alpha,
-    );
-    let size = 20.0 * m;
-    let cap_y = bar_y - size * 1.45 - 10.0 * m;
+    let et = spec.elapsed.as_secs_f32();
+    let phase = onyx_phase(alpha);
+    let mark = boot_mark(&ui);
+    boot_scene(&mut ui, et, &phase, &mark);
+    // The caption, in the tag's register: its glow copies first, then
+    // the face copy, anchored to the boot bar's top edge so it clears
+    // the diamond's bottom vertex at every window size.
+    let sx = ui.w / 1920.0;
+    let sy = ui.h / 1080.0;
+    let size = 26.0 * sx.min(sy);
+    let (_, _, bar_y, _) = boot_bar_rect(&ui);
+    let cap_y = bar_y - 14.0 * sy - size * 1.45;
     let cx = ui.w / 2.0;
+    let glow = boot_rgba(0xA4B6FF, 0.16 * alpha);
+    for (dx, dy) in [
+        (-1.5 * sx, 0.0),
+        (1.5 * sx, 0.0),
+        (0.0, -1.5 * sy),
+        (0.0, 1.5 * sy),
+    ] {
+        onyx_tracked(&mut ui, spec.caption, size, 0.6, cx + dx, cap_y + dy, glow);
+    }
     onyx_tracked(
         &mut ui,
         spec.caption,
         size,
-        0.35,
+        0.6,
         cx,
         cap_y,
-        boot_rgba(0xC3CCF7, 0.9 * alpha),
+        boot_rgba(0xC3CCF7, 0.95 * alpha),
     );
+    boot_bar(&mut ui, fraction.unwrap_or(0.0), et, &phase);
     ui.finish();
 }
 
@@ -2067,6 +2062,56 @@ mod tests {
     }
 
     #[test]
+    fn the_boot_frame_is_byte_identical_in_shape() {
+        // The golden shape of a boot frame: exact vertex and patch
+        // counts for three reference frames, captured on the tree
+        // before the boot-scene extraction (the starfield is
+        // hash-seeded and glyph rasterisation is cached, so the counts
+        // are deterministic). The loading kit reuses the boot's draw
+        // helpers; if this test moves, the extraction changed what the
+        // boot screen renders and the refactor — not this test — is
+        // wrong. The frames draw in sequence on one atlas, like the
+        // real boot: the first frame pays the glyph patches, the later
+        // ones hit the warm cache.
+        reset_atlas();
+        let atlas = HudAtlas::boot();
+        let mut a = HudBatch::new([1280, 720]);
+        draw_boot(
+            &atlas,
+            &mut a,
+            0.5,
+            Duration::from_secs(2),
+            None,
+            BOOT_SEQ_TOTAL,
+            false,
+        );
+        assert_eq!((a.vertices.len(), a.patches.len()), (12042, 16));
+        let mut b = HudBatch::new([1280, 720]);
+        draw_boot(
+            &atlas,
+            &mut b,
+            1.0,
+            Duration::from_secs(2),
+            None,
+            BOOT_SEQ_TOTAL,
+            false,
+        );
+        assert_eq!((b.vertices.len(), b.patches.len()), (12042, 0));
+        let mut c = HudBatch::new([1280, 720]);
+        draw_boot(
+            &atlas,
+            &mut c,
+            1.0,
+            Duration::from_secs(2),
+            Some(Duration::from_millis(2750)),
+            BOOT_SEQ_TOTAL,
+            true,
+        );
+        assert_eq!((c.vertices.len(), c.patches.len()), (7644, 0));
+        reset_atlas();
+    }
+
+    #[test]
     fn the_onyx_exit_holds_then_fades_then_ends() {
         assert_eq!(onyx_exit_alpha(Duration::ZERO), Some(1.0));
         assert_eq!(onyx_exit_alpha(ONYX_EXIT_HOLD), Some(1.0));
@@ -2097,7 +2142,25 @@ mod tests {
     }
 
     #[test]
-    fn the_onyx_loading_screen_is_black_with_a_caption_and_a_bar() {
+    fn the_onyx_phase_is_neutral_at_full_alpha() {
+        assert_eq!(onyx_phase(1.0), BootPhase::NEUTRAL);
+        let p = onyx_phase(0.5);
+        assert_eq!(p.fade, 0.5);
+        assert_eq!(p.star_fade, 0.5);
+        assert_eq!(p.halo_fade, 0.5);
+        assert_eq!(p.bar_alpha, 0.5);
+        // Nothing else moves: no finish behaviour leaks into the kit.
+        assert_eq!(p.bar_flash, 0.0);
+        assert_eq!(p.bar_drop, 0.0);
+        assert_eq!(p.logo_scale, 1.0);
+        assert_eq!(p.gem_scale, 1.0);
+        assert_eq!(p.tag_scale, 1.0);
+        assert!(p.ghosts.iter().all(|g| g.0 == 0.0));
+        assert!(!p.done);
+    }
+
+    #[test]
+    fn the_onyx_loading_screen_wears_the_boot_scene() {
         reset_atlas();
         let atlas = HudAtlas::boot();
         let draw = |fraction: f32| {
@@ -2108,9 +2171,8 @@ mod tests {
                 OnyxLoading {
                     caption: "LOADING ASSETS",
                     fraction: Some(fraction),
-                    elapsed: Duration::from_secs(1),
+                    elapsed: Duration::from_secs(3),
                     finishing: None,
-                    wordmark: false,
                 },
             );
             batch
@@ -2124,43 +2186,117 @@ mod tests {
         assert!(bg.iter().all(|v| v.pos[1] == 0.0 || v.pos[1] == h));
         assert!(
             !batch.patches.is_empty(),
-            "the caption's glyphs are queued for the atlas"
+            "the glyphs are queued for the atlas"
         );
-        // The bar lives in its band at 83.25% of the height. Its border
-        // spans the bar at any fraction, so measure the pale fill —
-        // drawn only where the bar is filled: half full it stops
-        // mid-frame, full it reaches the bar's right end.
-        let pale = boot_rgba(0xC3CCF7, 0.95);
-        let fill_max = |b: &HudBatch| {
-            b.vertices
-                .iter()
-                .filter(|v| {
-                    v.color == pale && v.pos[1] > h * 0.79 && v.pos[1] < h * 0.88
-                })
-                .map(|v| v.pos[0])
-                .fold(f32::MIN, f32::max)
-        };
-        let half = fill_max(&batch);
+        // The scene is present by mass: halo, starfield, diamond and
+        // wordmark are 12,564 vertices on this harness (measured);
+        // the v1 kit's flat frame — a field, a text wordmark and a
+        // bar — was a few hundred. The threshold is half the count.
         assert!(
-            half > w * 0.35 && half < w * 0.6,
-            "the half bar's fill ends mid-frame: {half} of {w}"
+            batch.vertices.len() > 6_000,
+            "the boot scene is drawn: {} vertices",
+            batch.vertices.len()
         );
-        let full = fill_max(&draw(1.0));
-        assert!(full > w * 0.7, "the full bar's fill reaches its end: {full}");
-        // The wordmark adds its glyphs over the field.
-        let mut marked = HudBatch::new([1280, 720]);
-        draw_onyx_loading(
-            &atlas,
-            &mut marked,
-            OnyxLoading {
-                caption: "LOADING ASSETS",
-                fraction: Some(0.5),
-                elapsed: Duration::from_secs(1),
-                finishing: None,
-                wordmark: true,
-            },
+        // Stars: white at partial alpha in the top band (the field
+        // there is opaque black, and nothing else in the scene draws
+        // plain white that high).
+        assert!(
+            batch.vertices.iter().any(|v| {
+                v.pos[1] < h * 0.10
+                    && (v.color & 0x00FF_FFFF) == 0x00FF_FFFF
+                    && (1..255).contains(&(v.color >> 24))
+            }),
+            "the starfield reaches the top of the frame"
         );
-        assert!(marked.vertices.len() > batch.vertices.len());
+        // The wordmark is the polished onyx, not flat text: in the
+        // centre band there are vertices painted with the gradient's
+        // dark near-grey stops (measured on this harness: (106, 108,
+        // 118) and (110, 112, 122)), a colour flat white text — and
+        // everything else in the scene — never has.
+        let dark_stop = |v: &crate::hud::HudVertex| {
+            let (r, g, b) = (
+                (v.color & 0xFF) as i32,
+                ((v.color >> 8) & 0xFF) as i32,
+                ((v.color >> 16) & 0xFF) as i32,
+            );
+            (60..=115).contains(&r)
+                && (60..=115).contains(&g)
+                && (60..=125).contains(&b)
+                && (b - r).abs() <= 12
+                && (g - r).abs() <= 3
+        };
+        assert!(
+            batch
+                .vertices
+                .iter()
+                .any(|v| v.pos[1] > h * 0.3 && v.pos[1] < h * 0.6 && dark_stop(v)),
+            "the wordmark wears the onyx gradient"
+        );
+        // And the slit is there: the tag's pale periwinkle rides
+        // inside it, in the same centre band.
+        let pale = boot_rgba(0xC3CCF7, 0.95);
+        assert!(
+            batch
+                .vertices
+                .iter()
+                .any(|v| v.color == pale && v.pos[1] > h * 0.3 && v.pos[1] < h * 0.6),
+            "the tag sits in the slit"
+        );
+        // The bar is the boot bar: probe the fill's coverage at the
+        // bar's vertical centre (from `boot_bar_rect`), at the fill
+        // height — the border strips span the full width at any
+        // fraction, so only coverage inside the bar says where the
+        // fill ends.
+        let (bar_mid, cap_lo, cap_hi) = {
+            let mut scratch = HudBatch::new([1280, 720]);
+            let ui = Ui::new(&atlas, &mut scratch, (0.0, 0.0));
+            let k = ui.density / ui.scale;
+            let (_, _, bar_y, bar_h) = boot_bar_rect(&ui);
+            let sy = ui.h / 1080.0;
+            let size = 26.0 * (ui.w / 1920.0).min(sy);
+            (
+                (bar_y + bar_h / 2.0) * k,
+                (bar_y - 14.0 * sy - size * 1.45) * k,
+                (bar_y - 14.0 * sy) * k,
+            )
+        };
+        let covered = |b: &HudBatch, x: f32, y: f32, color: u32| {
+            let edge = |a: [f32; 2], b: [f32; 2], p: [f32; 2]| {
+                (p[0] - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (p[1] - b[1])
+            };
+            b.vertices.chunks_exact(3).any(|t| {
+                t.iter().all(|v| v.color == color) && {
+                    let (d1, d2, d3) = (
+                        edge(t[0].pos, t[1].pos, [x, y]),
+                        edge(t[1].pos, t[2].pos, [x, y]),
+                        edge(t[2].pos, t[0].pos, [x, y]),
+                    );
+                    !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+                }
+            })
+        };
+        let full = draw(1.0);
+        assert!(
+            covered(&full, w * 0.93, bar_mid, u32::MAX),
+            "the full bar's fill reaches toward the right margin"
+        );
+        assert!(
+            covered(&batch, w * 0.48, bar_mid, u32::MAX),
+            "the half bar's fill covers its half"
+        );
+        assert!(
+            !covered(&batch, w * 0.52, bar_mid, u32::MAX),
+            "the half bar's fill stops at its fraction"
+        );
+        // The caption sits in its band above the bar, in the tag's
+        // colour at the tag's alpha.
+        assert!(
+            batch
+                .vertices
+                .iter()
+                .any(|v| { v.color == pale && v.pos[1] > cap_lo - 2.0 && v.pos[1] < cap_hi + 2.0 }),
+            "the caption rides above the bar in the tag register"
+        );
         // A played-out exit draws nothing at all.
         let mut done = HudBatch::new([1280, 720]);
         draw_onyx_loading(
@@ -2169,12 +2305,54 @@ mod tests {
             OnyxLoading {
                 caption: "LOADING ASSETS",
                 fraction: Some(1.0),
-                elapsed: Duration::from_secs(1),
+                elapsed: Duration::from_secs(3),
                 finishing: Some(Duration::from_secs(5)),
-                wordmark: false,
             },
         );
         assert!(done.vertices.is_empty());
+        reset_atlas();
+    }
+
+    #[test]
+    fn the_onyx_backdrop_is_black_with_stars() {
+        reset_atlas();
+        let atlas = HudAtlas::boot();
+        let mut batch = HudBatch::new([1280, 720]);
+        draw_onyx_backdrop(&atlas, &mut batch, Duration::from_secs(3), 1.0);
+        let (w, h) = (batch.width, batch.height);
+        // The first quad is the pure black field over the whole frame.
+        let bg = &batch.vertices[..6];
+        assert!(bg.iter().all(|v| v.color == 0xFF00_0000));
+        assert!(bg.iter().all(|v| v.pos[0] == 0.0 || v.pos[0] == w));
+        assert!(bg.iter().all(|v| v.pos[1] == 0.0 || v.pos[1] == h));
+        // Stars: white at partial alpha in the top band.
+        assert!(
+            batch.vertices.iter().any(|v| {
+                v.pos[1] < h * 0.10
+                    && (v.color & 0x00FF_FFFF) == 0x00FF_FFFF
+                    && (1..255).contains(&(v.color >> 24))
+            }),
+            "the starfield reaches the top of the frame"
+        );
+        // A subset of the full scene — no diamond, no wordmark — so
+        // strictly less than a full kit frame on the same harness.
+        let mut full = HudBatch::new([1280, 720]);
+        draw_onyx_loading(
+            &atlas,
+            &mut full,
+            OnyxLoading {
+                caption: "LOADING ASSETS",
+                fraction: Some(0.5),
+                elapsed: Duration::from_secs(3),
+                finishing: None,
+            },
+        );
+        assert!(
+            batch.vertices.len() < full.vertices.len(),
+            "the backdrop is a subset: {} vs {}",
+            batch.vertices.len(),
+            full.vertices.len()
+        );
         reset_atlas();
     }
 

@@ -1317,7 +1317,6 @@ impl Loading {
                     fraction: Some(self.progress.fraction()),
                     elapsed: self.started.elapsed(),
                     finishing: None,
-                    wordmark: false,
                 },
             );
         } else if let Some((win, frame)) = &mut self.menu.win {

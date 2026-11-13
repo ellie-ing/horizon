@@ -277,7 +277,6 @@ impl Game<'_> {
                 fraction: Some(progress),
                 elapsed: self.started.elapsed(),
                 finishing: None,
-                wordmark: false,
             },
         );
         renderer.render(&loading_frame(&hud))?;

@@ -16036,7 +16036,13 @@ impl Game<'_> {
                 });
                 if let Some(renderer) = &mut self.renderer {
                     let mut hud = HudBatch::new([renderer.config.width, renderer.config.height]);
-                    horizon_client::level_loading::draw_file_fixer_onyx(
+                    horizon_client::ui_theme::draw_onyx_backdrop(
+                        &self.gui.atlas,
+                        &mut hud,
+                        self.started.elapsed(),
+                        1.0,
+                    );
+                    horizon_client::level_loading::draw_file_fixer_onyx_content(
                         &mut hud,
                         &self.gui.atlas,
                         upgrade,
@@ -16103,7 +16109,6 @@ impl Game<'_> {
                         fraction: Some(loader.progress.fraction()),
                         elapsed: self.started.elapsed(),
                         finishing: None,
-                        wordmark: false,
                     },
                 );
                 return renderer.render(&loading_frame(&hud));
@@ -16124,7 +16129,6 @@ impl Game<'_> {
                         fraction: Some(reload.progress.fraction()),
                         elapsed: self.started.elapsed(),
                         finishing: None,
-                        wordmark: true,
                     },
                 );
                 return renderer.render(&loading_frame(&hud));
@@ -16142,8 +16146,7 @@ impl Game<'_> {
             };
             if horizon_client::ui_theme::onyx_exit_alpha(done_for).is_some() {
                 if let Some(renderer) = &mut self.renderer {
-                    let mut hud =
-                        HudBatch::new([renderer.config.width, renderer.config.height]);
+                    let mut hud = HudBatch::new([renderer.config.width, renderer.config.height]);
                     horizon_client::ui_theme::draw_onyx_loading(
                         &self.gui.atlas,
                         &mut hud,
@@ -16152,7 +16155,6 @@ impl Game<'_> {
                             fraction: Some(1.0),
                             elapsed: self.started.elapsed(),
                             finishing: Some(done_for),
-                            wordmark: true,
                         },
                     );
                     return renderer.render(&loading_frame(&hud));

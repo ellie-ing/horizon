@@ -652,16 +652,23 @@ pub fn draw_file_fixer(
 // buttons) and so keep their vanilla shape with the kit's bar and
 // caption register around it. The vanilla draws above stay untouched:
 // they remain the upstream-parity spec, and the fork's variants sit
-// beside them the way the boot screen's v1 sat beside the overlay.
+// beside them the way the boot screen sits beside the overlay.
 
-/// The kit's pale periwinkle (the boot tag's colour), RGB.
+/// The boot tag's pale periwinkle, RGB. No longer a fill colour — the
+/// v2 bar fills white — it survives as the connect screen's
+/// status-text colour, its one remaining use.
 const ONYX_PALE: (u8, u8, u8) = (0xC3, 0xCC, 0xF7);
 
-/// The kit's bar in GUI pixels: a translucent white track, the fill in
-/// pale periwinkle with a white leading segment — or, with no
-/// fraction, one bright segment sweeping the track (the surface has no
-/// number to show, and the kit never invents one). 4 px tall: the
-/// vanilla bars' footprint, grown just enough to read.
+/// The bar construction, in GUI pixels, shared by every screen that
+/// keeps its own layout: a 1 px white strip along the top and bottom
+/// edges (the side strips the boot bar draws would be sub-pixel at
+/// this height, so they are omitted), and between them a translucent
+/// white track the fill covers in solid white — or, with no fraction,
+/// one white segment sweeping the track (the surface has no number to
+/// show, and the kit never invents one). The boot bar's periwinkle
+/// fill stays the boot bar's: these screens carry content the fill
+/// must not out-shout. 4 px tall: the vanilla bars' footprint, grown
+/// just enough to read.
 pub fn draw_onyx_bar(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
@@ -671,22 +678,19 @@ pub fn draw_onyx_bar(
     fraction: Option<f32>,
     elapsed: std::time::Duration,
 ) {
-    batch.fill(atlas, left, top, width, 4.0, crate::hud::rgba(255, 255, 255, 36));
-    let (r, g, b) = ONYX_PALE;
+    batch.fill(
+        atlas,
+        left,
+        top + 1.0,
+        width,
+        2.0,
+        crate::hud::rgba(255, 255, 255, 36),
+    );
     match fraction {
         Some(f) => {
             let fill_w = width * f.clamp(0.0, 1.0);
             if fill_w > 0.0 {
-                batch.fill(atlas, left, top, fill_w, 4.0, crate::hud::rgba(r, g, b, 242));
-                let lead = fill_w.min(12.0);
-                batch.fill(
-                    atlas,
-                    left + fill_w - lead,
-                    top,
-                    lead,
-                    4.0,
-                    u32::MAX,
-                );
+                batch.fill(atlas, left, top + 1.0, fill_w, 2.0, u32::MAX);
             }
         }
         None => {
@@ -695,19 +699,28 @@ pub fn draw_onyx_bar(
             let off = -seg + (width + seg) * u;
             let (x0, x1) = (left + off.max(0.0), left + (off + seg).min(width));
             if x1 > x0 {
-                batch.fill(atlas, x0, top, x1 - x0, 4.0, crate::hud::rgba(r, g, b, 140));
+                batch.fill(
+                    atlas,
+                    x0,
+                    top + 1.0,
+                    x1 - x0,
+                    2.0,
+                    crate::hud::rgba(255, 255, 255, 140),
+                );
                 let core = (x1 - x0) * 0.4;
                 batch.fill(
                     atlas,
                     (x0 + x1) / 2.0 - core / 2.0,
-                    top,
+                    top + 1.0,
                     core,
-                    4.0,
+                    2.0,
                     crate::hud::rgba(255, 255, 255, 230),
                 );
             }
         }
     }
+    batch.fill(atlas, left, top, width, 1.0, u32::MAX);
+    batch.fill(atlas, left, top + 3.0, width, 1.0, u32::MAX);
 }
 
 /// `LevelLoadingScreen` in the kit's clothes: the chunk status map is
@@ -793,14 +806,31 @@ pub fn draw_connecting_onyx(
     }
 }
 
-/// `FileFixerProgressScreen` in the kit's clothes: the full treatment
-/// for the longest surface — the black field (the caller adds the
-/// static wordmark), both progress bars become the kit's, and the
-/// scanning wait sweeps. The counts, the stage line and the type's
-/// percentage keep their grey register and their translations, and
-/// Cancel is vanilla's button, inactive once pressed, exactly as
-/// `draw_file_fixer` draws it.
+/// `FileFixerProgressScreen` in the kit's clothes, over its own black
+/// field: both progress bars become the kit's, and the scanning wait
+/// sweeps. The counts, the stage line and the type's percentage keep
+/// their grey register and their translations, and Cancel is vanilla's
+/// button, inactive once pressed, exactly as `draw_file_fixer` draws
+/// it. The production caller paints the boot's starfield backdrop
+/// (`ui_theme::draw_onyx_backdrop`) instead and draws
+/// `draw_file_fixer_onyx_content` over it, then the mini wordmark;
+/// this wrapper keeps the plain-field form for the tests.
 pub fn draw_file_fixer_onyx(
+    batch: &mut HudBatch,
+    atlas: &HudAtlas,
+    progress: &horizon_world::datafix::progress::UpgradeProgress,
+    cursor: (f32, f32),
+    elapsed: std::time::Duration,
+) {
+    let (w, h) = (batch.width, batch.height);
+    batch.fill(atlas, 0.0, 0.0, w, h, opaque(0));
+    draw_file_fixer_onyx_content(batch, atlas, progress, cursor, elapsed);
+}
+
+/// The world upgrade's content without a field of its own: the title,
+/// the counts, the bars and the Cancel button, drawn over whatever
+/// field the caller painted (see `draw_file_fixer_onyx`).
+pub fn draw_file_fixer_onyx_content(
     batch: &mut HudBatch,
     atlas: &HudAtlas,
     progress: &horizon_world::datafix::progress::UpgradeProgress,
@@ -809,7 +839,6 @@ pub fn draw_file_fixer_onyx(
 ) {
     const GREY: u32 = 0xFFA0_A0A0;
     let (w, h) = (batch.width, batch.height);
-    batch.fill(atlas, 0.0, 0.0, w, h, opaque(0));
     let (x_center, y_center) = ((w as i32) / 2, (h as i32) / 2);
     let text_top = y_center - 50;
     centered_line(
@@ -942,27 +971,48 @@ mod tests {
             Some(0.5),
             std::time::Duration::ZERO,
         );
-        let pale = crate::hud::rgba(0xC3, 0xCC, 0xF7, 242);
-        let band = |want: u32| {
+        // Probe coverage, not corner positions: the border strips
+        // and the fill share their colour and their edge rows, so
+        // only a point inside the bar says what paints there.
+        let covered = |x: f32, y: f32, color: u32| {
+            let edge = |a: [f32; 2], b: [f32; 2], p: [f32; 2]| {
+                (p[0] - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (p[1] - b[1])
+            };
+            batch.vertices.chunks_exact(3).any(|t| {
+                t.iter().all(|v| v.color == color) && {
+                    let (d1, d2, d3) = (
+                        edge(t[0].pos, t[1].pos, [x, y]),
+                        edge(t[1].pos, t[2].pos, [x, y]),
+                        edge(t[2].pos, t[0].pos, [x, y]),
+                    );
+                    !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+                }
+            })
+        };
+        let track = crate::hud::rgba(255, 255, 255, 36);
+        // The track spans the whole bar, between the border strips.
+        assert!(covered(299.0, 52.0, track), "the track reaches the end");
+        // The strips cap the bar's top and bottom edges in white.
+        assert!(covered(150.0, 50.5, u32::MAX), "the top strip is drawn");
+        assert!(covered(150.0, 53.5, u32::MAX), "the bottom strip is drawn");
+        // The fill is solid white and stops at the fraction.
+        assert!(covered(199.0, 52.0, u32::MAX), "the fill covers its half");
+        assert!(!covered(201.0, 52.0, u32::MAX), "the fill stops there");
+        // Nothing wears the v1 periwinkle fill any more.
+        assert!(
             batch
                 .vertices
                 .iter()
-                .filter(|v| v.color == want && v.pos[1] >= 50.0 && v.pos[1] <= 54.0)
-                .map(|v| v.pos[0])
-                .fold(f32::MIN, f32::max)
-        };
-        // The track spans the whole bar; the fill and its white leading
-        // segment stop at the fraction.
-        assert_eq!(band(crate::hud::rgba(255, 255, 255, 36)), 300.0);
-        assert_eq!(band(pale), 200.0);
-        assert_eq!(band(u32::MAX), 200.0);
+                .all(|v| v.color != crate::hud::rgba(0xC3, 0xCC, 0xF7, 242)),
+            "the periwinkle fill is gone"
+        );
     }
 
     #[test]
     fn the_onyx_bar_sweeps_when_there_is_no_fraction() {
         let atlas =
             HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap();
-        let sweep_pale = crate::hud::rgba(0xC3, 0xCC, 0xF7, 140);
+        let sweep = crate::hud::rgba(255, 255, 255, 140);
         let mut batch = HudBatch::new([400, 300]);
         draw_onyx_bar(
             &mut batch,
@@ -974,7 +1024,7 @@ mod tests {
             std::time::Duration::ZERO,
         );
         assert!(
-            batch.vertices.iter().all(|v| v.color != sweep_pale),
+            batch.vertices.iter().all(|v| v.color != sweep),
             "at t=0 the segment is still off the track"
         );
         let mut batch = HudBatch::new([400, 300]);
@@ -988,7 +1038,7 @@ mod tests {
             std::time::Duration::from_millis(600),
         );
         assert!(
-            batch.vertices.iter().any(|v| v.color == sweep_pale),
+            batch.vertices.iter().any(|v| v.color == sweep),
             "mid-period the segment is on the track"
         );
     }
@@ -997,7 +1047,7 @@ mod tests {
     fn the_onyx_level_screen_sweeps_without_a_map_and_waits_with_one() {
         let atlas =
             HudAtlas::build(std::path::Path::new("/nonexistent/horizon-test-assets")).unwrap();
-        let sweep_pale = crate::hud::rgba(0xC3, 0xCC, 0xF7, 140);
+        let sweep = crate::hud::rgba(255, 255, 255, 140);
         // No map (a server's terrain load): caption plus the sweep.
         let mut batch = HudBatch::new([400, 300]);
         draw_onyx(
@@ -1007,7 +1057,7 @@ mod tests {
             None,
             std::time::Duration::from_millis(600),
         );
-        assert!(batch.vertices.iter().any(|v| v.color == sweep_pale));
+        assert!(batch.vertices.iter().any(|v| v.color == sweep));
         // A map but no progress yet: the map's cells, and no bar at all.
         let mut batch = HudBatch::new([400, 300]);
         let status = |_: i32, _: i32| Some(Status::Full);
@@ -1024,7 +1074,7 @@ mod tests {
                 .iter()
                 .any(|v| v.color == opaque(Status::Full.color()))
         );
-        assert!(batch.vertices.iter().all(|v| v.color != sweep_pale));
+        assert!(batch.vertices.iter().all(|v| v.color != sweep));
         assert!(
             batch
                 .vertices
@@ -1051,8 +1101,8 @@ mod tests {
         let bg = &batch.vertices[..6];
         assert!(bg.iter().all(|v| v.color == 0xFF00_0000));
         // A fresh progress is still scanning: its wait sweeps.
-        let sweep_pale = crate::hud::rgba(0xC3, 0xCC, 0xF7, 140);
-        assert!(batch.vertices.iter().any(|v| v.color == sweep_pale));
+        let sweep = crate::hud::rgba(255, 255, 255, 140);
+        assert!(batch.vertices.iter().any(|v| v.color == sweep));
     }
 
     #[test]
