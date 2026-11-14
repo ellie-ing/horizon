@@ -1308,15 +1308,18 @@ impl Loading {
             return false;
         };
         if self.menu.pending.is_some() {
+            // ONYX fork: the queued entry waits on the loader's tail,
+            // the same wait the game's parked entry shows — the
+            // backdrop treatment and the stage fraction, so the twins
+            // cannot drift apart (see `draw_onyx_entry_wait`).
             let caption = horizon_client::ui_theme::onyx_caption(self.progress.line());
-            horizon_client::ui_theme::draw_onyx_loading(
+            horizon_client::ui_theme::draw_onyx_entry_wait(
                 &gui.atlas,
                 batch,
-                horizon_client::ui_theme::OnyxLoading {
+                horizon_client::ui_theme::OnyxEntryWait {
                     caption: &caption,
-                    fraction: Some(self.progress.fraction()),
+                    fraction: Some(self.progress.stage_fraction()),
                     elapsed: self.started.elapsed(),
-                    finishing: None,
                 },
             );
         } else if let Some((win, frame)) = &mut self.menu.win {
@@ -1512,6 +1515,135 @@ mod tests {
         // Out-of-range reports clamp.
         progress.advance_to(2.0);
         assert_eq!(progress.fraction(), 1.0);
+    }
+
+    #[test]
+    fn the_stage_fraction_ignores_the_boot_finishs_fine_advance() {
+        let progress = Progress::new();
+        progress.set(7);
+        assert!((progress.stage_fraction() - 7.0 / 9.0).abs() < 1e-6);
+        // The boot finish advancing the fine fraction to 1.0 is what
+        // pinned the entry wait's bar at full under LOADING RECIPES:
+        // `fraction()` follows it, the stage fraction must not.
+        progress.advance_to(1.0);
+        assert_eq!(progress.fraction(), 1.0);
+        assert!((progress.stage_fraction() - 7.0 / 9.0).abs() < 1e-6);
+        assert_eq!(progress.line(), STAGE_LINES[7]);
+        progress.set(8);
+        assert!((progress.stage_fraction() - 8.0 / 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_queued_entry_waits_on_the_backdrop_for_every_entry_kind() {
+        // The menu-phase twin of the game's parked-entry wait: for a
+        // create, a play and a connect alike, the queued entry's
+        // frame is the entry-wait treatment — the backdrop, the mini
+        // wordmark, the caption, the composite bar — never the boot
+        // scene. The two draw sites share `draw_onyx_entry_wait`, and
+        // this pins the menu site to it.
+        let root = std::env::temp_dir().join("horizon-startup-menu-entry-wait");
+        // The boot wordmark's polished gradient stops (the probe the
+        // kit's own scene test uses to prove the lockup is present).
+        let dark_stop = |v: &horizon_client::hud::HudVertex| {
+            let (r, g, b) = (
+                (v.color & 0xFF) as i32,
+                ((v.color >> 8) & 0xFF) as i32,
+                ((v.color >> 16) & 0xFF) as i32,
+            );
+            (60..=115).contains(&r)
+                && (60..=115).contains(&g)
+                && (60..=125).contains(&b)
+                && (b - r).abs() <= 12
+                && (g - r).abs() <= 3
+        };
+        let track = horizon_client::hud::rgba(255, 255, 255, 36);
+        for action in [
+            Action::Play {
+                folder: "World".into(),
+            },
+            Action::Create {
+                folder: "World".into(),
+                name: "World".into(),
+                seed: None,
+                creative: false,
+                options: Default::default(),
+            },
+            Action::Connect {
+                address: "localhost:25565".into(),
+                lan: true,
+            },
+        ] {
+            let (_send, receiver) = std::sync::mpsc::channel();
+            let mut loading = loading(receiver);
+            loading.set_ui(gui(&root), root.clone());
+            loading.menu.queue_entry(action, "Player".into());
+            let mut batch = HudBatch::new([1280, 720]);
+            assert!(
+                !loading.draw_menu(&mut batch),
+                "the wait is not a title frame"
+            );
+            let (w, h) = (batch.width, batch.height);
+            // The backdrop's black field is the frame's base.
+            let bg = &batch.vertices[..6];
+            assert!(bg.iter().all(|v| v.color == 0xFF00_0000));
+            assert!(bg.iter().all(|v| v.pos[0] == 0.0 || v.pos[0] == w));
+            assert!(bg.iter().all(|v| v.pos[1] == 0.0 || v.pos[1] == h));
+            // No polished wordmark in the centre band: no lockup.
+            assert!(
+                !batch
+                    .vertices
+                    .iter()
+                    .any(|v| v.pos[1] > h * 0.3 && v.pos[1] < h * 0.6 && dark_stop(v)),
+                "a queued entry never wears the boot lockup"
+            );
+            // The bar is the composite bar, not the boot bar: its
+            // track spans exactly the centred 200 GUI px, its white
+            // strips cap that span, and no solid-white geometry
+            // reaches outside it — the boot bar's strips run nearly
+            // the frame's full width along the bottom. (The caption
+            // and wordmark cannot be probed here: this harness's
+            // atlas carries font metrics only, so glyphs emit no
+            // vertices; the shared draw's text is pinned by the
+            // ui_theme tests.)
+            let left = (w - 200.0) / 2.0;
+            let track_ys: Vec<f32> = batch
+                .vertices
+                .iter()
+                .filter(|v| v.color == track)
+                .map(|v| v.pos[1])
+                .collect();
+            assert_eq!(track_ys.len(), 6, "the composite bar's track is drawn");
+            let track_y = track_ys[0];
+            let track_xs: Vec<f32> = batch
+                .vertices
+                .iter()
+                .filter(|v| v.color == track)
+                .map(|v| v.pos[0])
+                .collect();
+            let (tx0, tx1) = track_xs
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(*x), b.max(*x)));
+            assert!(
+                (tx0 - left).abs() < 1.0 && (tx1 - (left + 200.0)).abs() < 1.0,
+                "the track spans the centred bar: {tx0}..{tx1}"
+            );
+            let white: Vec<&horizon_client::hud::HudVertex> = batch
+                .vertices
+                .iter()
+                .filter(|v| v.color == u32::MAX)
+                .collect();
+            assert!(
+                white
+                    .iter()
+                    .all(|v| v.pos[0] >= left - 1.0 && v.pos[0] <= left + 201.0),
+                "no white geometry outside the composite bar's span"
+            );
+            assert!(
+                white.iter().any(|v| v.pos[1] < track_y)
+                    && white.iter().any(|v| v.pos[1] > track_y),
+                "the strips cap the bar above and below its track"
+            );
+        }
     }
 
     #[test]

@@ -1709,7 +1709,11 @@ pub fn draw_boot(
 // fades over ~250 ms (see `onyx_phase`). Surfaces that carry data,
 // buttons or another screen's context (the chunk map, the file fixer,
 // the connect screens) get the boot's bar construction and nothing
-// else, from `level_loading::draw_onyx_bar`.
+// else, from `level_loading::draw_onyx_bar`. One surface stands with
+// the world upgrade's exception: the deferred-entry wait is the boot
+// load's own tail rather than a screen of its own, so it wears the
+// backdrop and the mini wordmark instead of the scene
+// (`draw_onyx_entry_wait`).
 
 /// The kit's exit: how long the completed frame holds before the fade.
 pub const ONYX_EXIT_HOLD: Duration = Duration::from_millis(200);
@@ -1800,6 +1804,30 @@ fn onyx_tracked(ui: &mut Ui, text: &str, size: f32, tracking: f32, cx: f32, y: f
         ui.text(Face::Mono, size, x, y, color, c.encode_utf8(&mut buf));
         x += w + tracking;
     }
+}
+
+/// The kit's caption centred on `cy`: the boot tag's register — same
+/// face, size, tracking, colour and glow as the caption
+/// `draw_onyx_loading` anchors above the boot bar — placed mid-frame
+/// instead, for a surface whose bar is the composite one. Returns the
+/// caption box's bottom edge, so the caller can set the bar under it.
+fn onyx_caption_centred(ui: &mut Ui, caption: &str, cy: f32) -> f32 {
+    let sx = ui.w / 1920.0;
+    let sy = ui.h / 1080.0;
+    let size = 26.0 * sx.min(sy);
+    let y = cy - size * 1.45 / 2.0;
+    let cx = ui.w / 2.0;
+    let glow = boot_rgba(0xA4B6FF, 0.16);
+    for (dx, dy) in [
+        (-1.5 * sx, 0.0),
+        (1.5 * sx, 0.0),
+        (0.0, -1.5 * sy),
+        (0.0, 1.5 * sy),
+    ] {
+        onyx_tracked(ui, caption, size, 0.6, cx + dx, y + dy, glow);
+    }
+    onyx_tracked(ui, caption, size, 0.6, cx, y, boot_rgba(0xC3CCF7, 0.95));
+    y + size * 1.45
 }
 
 /// S10's mini wordmark: the wordmark and its HORIZON CLIENT tag as
@@ -1943,6 +1971,53 @@ pub fn draw_onyx_loading(atlas: &HudAtlas, batch: &mut HudBatch, spec: OnyxLoadi
     );
     boot_bar(&mut ui, fraction.unwrap_or(0.0), et, &phase);
     ui.finish();
+}
+
+/// The deferred-entry wait, as `draw_onyx_entry_wait` needs it: the
+/// loader's stage caption (already resolved, see `onyx_caption`), the
+/// bar's fraction — the loader's *stage* fraction, never the fine
+/// fraction the boot finish forced to 1.0 — or `None` for the sweep,
+/// and the loader clock the kit's ambient motion runs on.
+pub struct OnyxEntryWait<'a> {
+    pub caption: &'a str,
+    pub fraction: Option<f32>,
+    pub elapsed: Duration,
+}
+
+/// The wait for the game's world-resources loader, shown when a world
+/// entry (create, play or connect) is attempted while the loader's
+/// tail is still running behind the title. That wait is the boot
+/// load's own tail — game data stages, identical for every entry
+/// kind — not a world-entry screen, so it does not wear the boot
+/// scene: the starfield backdrop and the mini wordmark (the world
+/// upgrade's treatment), the stage caption in the boot tag's register
+/// at mid-frame, and the composite white bar under it. The full
+/// lockup stays with the surfaces that are screens of their own:
+/// the pack reload and the saving screen.
+pub fn draw_onyx_entry_wait(atlas: &HudAtlas, batch: &mut HudBatch, spec: OnyxEntryWait<'_>) {
+    draw_onyx_backdrop(atlas, batch, spec.elapsed, 1.0);
+    let bar_top = {
+        let mut ui = Ui::new(atlas, batch, (0.0, 0.0));
+        onyx_wordmark(&mut ui, 1.0);
+        let sy = ui.h / 1080.0;
+        let cy = 0.56 * ui.h;
+        let bottom = onyx_caption_centred(&mut ui, spec.caption, cy);
+        // The bar hangs the kit's caption gap under the caption,
+        // converted from dp to the batch's GUI pixels.
+        let top = (bottom + 14.0 * sy) * (ui.density / ui.scale);
+        ui.finish();
+        top
+    };
+    let left = (batch.width - 200.0) / 2.0;
+    crate::level_loading::draw_onyx_bar(
+        batch,
+        atlas,
+        left,
+        bar_top,
+        200.0,
+        spec.fraction,
+        spec.elapsed,
+    );
 }
 
 #[cfg(test)]
@@ -2310,6 +2385,157 @@ mod tests {
             },
         );
         assert!(done.vertices.is_empty());
+        reset_atlas();
+    }
+
+    #[test]
+    fn the_onyx_entry_wait_wears_the_backdrop_not_the_boot_scene() {
+        reset_atlas();
+        let atlas = HudAtlas::boot();
+        let mut batch = HudBatch::new([1280, 720]);
+        draw_onyx_entry_wait(
+            &atlas,
+            &mut batch,
+            OnyxEntryWait {
+                caption: "LOADING RECIPES",
+                fraction: Some(7.0 / 9.0),
+                elapsed: Duration::from_secs(3),
+            },
+        );
+        let (w, h) = (batch.width, batch.height);
+        // The first quad is the backdrop's pure black field.
+        let bg = &batch.vertices[..6];
+        assert!(bg.iter().all(|v| v.color == 0xFF00_0000));
+        assert!(bg.iter().all(|v| v.pos[0] == 0.0 || v.pos[0] == w));
+        assert!(bg.iter().all(|v| v.pos[1] == 0.0 || v.pos[1] == h));
+        // The backdrop is kept: stars in the top band, as in
+        // `the_onyx_backdrop_is_black_with_stars`.
+        assert!(
+            batch.vertices.iter().any(|v| {
+                v.pos[1] < h * 0.10
+                    && (v.color & 0x00FF_FFFF) == 0x00FF_FFFF
+                    && (1..255).contains(&(v.color >> 24))
+            }),
+            "the starfield reaches the top of the frame"
+        );
+        // But the boot scene is not: this frame measures 8,178
+        // vertices on this harness where the full kit frame (see
+        // `the_onyx_loading_screen_wears_the_boot_scene`) measures
+        // 12,594 — the diamond and the polished wordmark are the
+        // difference.
+        assert!(
+            batch.vertices.len() < 10_000,
+            "no boot-scene mass: {} vertices",
+            batch.vertices.len()
+        );
+        // The wordmark is the flat mini mark, not the polished onyx:
+        // none of the gradient's dark near-grey stops in the centre
+        // band (the probe `the_onyx_loading_screen_wears_the_boot_scene`
+        // uses to prove the polished wordmark is present there).
+        let dark_stop = |v: &crate::hud::HudVertex| {
+            let (r, g, b) = (
+                (v.color & 0xFF) as i32,
+                ((v.color >> 8) & 0xFF) as i32,
+                ((v.color >> 16) & 0xFF) as i32,
+            );
+            (60..=115).contains(&r)
+                && (60..=115).contains(&g)
+                && (60..=125).contains(&b)
+                && (b - r).abs() <= 12
+                && (g - r).abs() <= 3
+        };
+        assert!(
+            !batch
+                .vertices
+                .iter()
+                .any(|v| v.pos[1] > h * 0.3 && v.pos[1] < h * 0.6 && dark_stop(v)),
+            "the polished wordmark is absent"
+        );
+        // The caption is there, in the tag's colour at the tag's alpha.
+        let pale = boot_rgba(0xC3CCF7, 0.95);
+        assert!(
+            batch.vertices.iter().any(|v| v.color == pale),
+            "the caption rides in the tag register"
+        );
+        // The bar is the composite bar: the only solid-white geometry
+        // in the frame is its strips and fill (the caption, the mini
+        // wordmark and the stars all wear an alpha), so its extent is
+        // the bar's — centred, 200 GUI px wide — and the fill stops
+        // at the fraction.
+        let white: Vec<&crate::hud::HudVertex> = batch
+            .vertices
+            .iter()
+            .filter(|v| v.color == u32::MAX)
+            .collect();
+        let (ymin, ymax) = white
+            .iter()
+            .map(|v| v.pos[1])
+            .fold((f32::MAX, f32::MIN), |(a, b), y| (a.min(y), b.max(y)));
+        let (xmin, xmax) = white
+            .iter()
+            .map(|v| v.pos[0])
+            .fold((f32::MAX, f32::MIN), |(a, b), x| (a.min(x), b.max(x)));
+        assert!(
+            (xmax - xmin - 200.0).abs() < 1.0 && (xmin - (w - 200.0) / 2.0).abs() < 1.0,
+            "the bar is centred and 200 wide: {xmin}..{xmax} of {w}"
+        );
+        let covered = |x: f32, y: f32| {
+            let edge = |a: [f32; 2], b: [f32; 2], p: [f32; 2]| {
+                (p[0] - b[0]) * (a[1] - b[1]) - (a[0] - b[0]) * (p[1] - b[1])
+            };
+            batch.vertices.chunks_exact(3).any(|t| {
+                t.iter().all(|v| v.color == u32::MAX) && {
+                    let (d1, d2, d3) = (
+                        edge(t[0].pos, t[1].pos, [x, y]),
+                        edge(t[1].pos, t[2].pos, [x, y]),
+                        edge(t[2].pos, t[0].pos, [x, y]),
+                    );
+                    !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+                }
+            })
+        };
+        let mid_y = (ymin + ymax) / 2.0;
+        assert!(
+            covered(xmin + 100.0, mid_y),
+            "the fill covers the bar's first half"
+        );
+        assert!(
+            !covered(xmin + 199.0, mid_y),
+            "the fill stops at its fraction, it does not read full"
+        );
+        reset_atlas();
+    }
+
+    #[test]
+    fn the_onyx_entry_wait_draws_exactly_one_caption() {
+        reset_atlas();
+        let atlas = HudAtlas::boot();
+        // The caption's face copy is the only geometry in the frame
+        // wearing the tag colour at the tag's alpha (the glow copies
+        // wear the glow colour, the mini wordmark's tag a lower
+        // alpha), and each glyph is one quad: the face-coloured
+        // vertex count is the caption's glyph count, exactly once.
+        // This pins the draw to a single caption source — the overlap
+        // Ellie reported cannot come from this draw.
+        let face = boot_rgba(0xC3CCF7, 0.95);
+        let count = |caption: &str| {
+            let mut batch = HudBatch::new([1280, 720]);
+            draw_onyx_entry_wait(
+                &atlas,
+                &mut batch,
+                OnyxEntryWait {
+                    caption,
+                    fraction: Some(0.5),
+                    elapsed: Duration::from_secs(3),
+                },
+            );
+            batch.vertices.iter().filter(|v| v.color == face).count()
+        };
+        assert_eq!(count("AB"), 12);
+        assert_eq!(count("ABCD"), 24);
+        // A second call emits its own caption again; nothing from the
+        // first call leaks into it.
+        assert_eq!(count("AB"), 12);
         reset_atlas();
     }
 

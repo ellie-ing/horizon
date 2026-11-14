@@ -16101,14 +16101,18 @@ impl Game<'_> {
                 });
                 let mut hud = HudBatch::new([renderer.config.width, renderer.config.height]);
                 let caption = horizon_client::ui_theme::onyx_caption(loader.progress.line());
-                horizon_client::ui_theme::draw_onyx_loading(
+                // ONYX fork: the parked entry waits on the loader's
+                // tail, not on a screen of its own — the backdrop
+                // treatment, and the stage fraction: `fraction()`
+                // reads 1.0 here, forced by the boot finish while
+                // the stages are still running.
+                horizon_client::ui_theme::draw_onyx_entry_wait(
                     &self.gui.atlas,
                     &mut hud,
-                    horizon_client::ui_theme::OnyxLoading {
+                    horizon_client::ui_theme::OnyxEntryWait {
                         caption: &caption,
-                        fraction: Some(loader.progress.fraction()),
+                        fraction: Some(loader.progress.stage_fraction()),
                         elapsed: self.started.elapsed(),
-                        finishing: None,
                     },
                 );
                 return renderer.render(&loading_frame(&hud));
@@ -20499,6 +20503,15 @@ impl Progress {
         let stage = self.value.load(Ordering::Relaxed) as f32 / (self.lines.len() - 1) as f32;
         // ONYX fork: whichever view of the load is further along wins.
         stage.max(self.fine_fraction())
+    }
+    /// ONYX fork: the stage counter alone as a fraction, ignoring the
+    /// fine fraction. The boot finish advances the fine fraction to
+    /// 1.0 while the loader's tail (items, recipes, world resources)
+    /// is still running, so a surface that outlives the finish — the
+    /// deferred-entry wait — reads its progress from the stages or
+    /// claims a completion that has not happened.
+    fn stage_fraction(&self) -> f32 {
+        self.value.load(Ordering::Relaxed) as f32 / (self.lines.len() - 1) as f32
     }
     fn line(&self) -> &'static str {
         self.lines[(self.value.load(Ordering::Relaxed) as usize).min(self.lines.len() - 1)]
